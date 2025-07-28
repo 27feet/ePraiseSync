@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 
 class Student extends Model
@@ -12,6 +13,10 @@ class Student extends Model
 
         'record_id',
         'arbor_id',
+        'year_group',
+        'year_leader_emails',
+        'tutor_emails',
+        'name',
     ];
 
     protected $casts = [
@@ -19,10 +24,18 @@ class Student extends Model
         'updated_at' => 'datetime',
         'record_id' => 'integer',
         'arbor_id' => 'string',
+        'year_group' => 'string',
+        'year_leader_emails' => 'array',
+        'tutor_emails' => 'array',
+        'name' => 'string',
     ];
 
     public function points(): BelongsToMany
     {
         return $this->belongsToMany(Point::class, 'student_id', 'record_id');
+    }
+    public function detentionAllocations(): HasMany
+    {
+        return $this->hasMany(DetentionAllocation::class, 'student_id', 'arbor_id');
     }
 }

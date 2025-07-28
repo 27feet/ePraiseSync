@@ -11,14 +11,14 @@ return new class extends Migration
      */
     public function up(): void
     {
-        Schema::create('translate_points', function (Blueprint $table) {
+        Schema::create('detention_sessions', function (Blueprint $table) {
             $table->id();
             $table->timestamps();
-            $table->string('arbor_scale_id')->nullable();
-            $table->string('arbor_scale_name')->nullable();
-            $table->string('arbor_reason_id')->nullable();
-            $table->string('arbor_reason_name')->nullable();
-            $table->string('epraise_name');
+            $table->integer('detention_type_id')->unsigned();
+            $table->bigInteger('arbor_id')->unsigned()->unique();
+            $table->dateTime('start_date_time');
+            $table->dateTime('end_date_time');
+            $table->float('durationMinutes')->nullable();
         });
     }
 
@@ -27,6 +27,6 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('translate_points');
+        Schema::dropIfExists('detention_sessions');
     }
 };

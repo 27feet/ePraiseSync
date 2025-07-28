@@ -15,8 +15,14 @@ use App\Http\Controllers\FetchDemerits;
 use App\Http\Controllers\FetchStudents;
 use App\Http\Controllers\FetchTeachers;
 use App\Http\Controllers\FetchArborStaff;
+use App\Http\Controllers\KillConsentTest;
 use App\Http\Controllers\FetchArborClasses;
+use App\Http\Controllers\FetchAcademicYears;
+use App\Http\Controllers\FetchArborStudents;
 use App\Http\Controllers\FetchInterventions;
+use App\Http\Controllers\FetchDetentionSetup;
+use App\Http\Controllers\FetchDetentionAllocations;
+use App\Http\Controllers\FetchAcademicCalendarDates;
 use App\Http\Controllers\UpdateEpraisePointCategories;
 use App\Http\Controllers\FetchArborBehaviourCategories;
 use App\Http\Controllers\UpdateEpraiseDemeritCategories;
@@ -45,6 +51,21 @@ Route::get('/pointhistory', FetchPoints::class)
 
 Route::get('/teachers', FetchTeachers::class)
     ->name('teachers');
+
+Route::get('/fetchYears', FetchAcademicYears::class)
+    ->name('academicYears');
+
+Route::get('/fetchDetSetup', FetchDetentionSetup::class)
+    ->name('detentionSetup');
+
+Route::get('/fetchStudents', FetchArborStudents::class)
+    ->name('arborStudents');
+
+Route::get('/fetchDetAllocations', FetchDetentionAllocations::class)
+    ->name('detentionAllocations');
+
+Route::get('/fetchDates', FetchAcademicCalendarDates::class)
+    ->name('academicCalendarDates');
 
 Route::get('/arborstaff', FetchArborStaff::class)
     ->name('arborstaff');
@@ -114,6 +135,10 @@ Route::get('/dp', function () {
 
 Route::get('/arborScales', FetchArborPointScalesCategories::class)
     ->name('arborScales');
+
+
+Route::get('/consentTest', KillConsentTest::class)
+    ->name('consentTest');
 
 
 Route::get('/epp', UpdateEpraisePointCategories::class)

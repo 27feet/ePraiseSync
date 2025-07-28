@@ -16,6 +16,10 @@ return new class extends Migration
             $table->timestamps();
             $table->bigInteger('record_id')->unsigned()->unique();
             $table->bigInteger('arbor_id')->unsigned()->unique();
+            $table->string('name')->nullable();
+            $table->string('year_group')->nullable();
+            $table->json('year_leader_emails')->nullable();
+            $table->json('tutor_emails')->nullable();
         });
     }
 
