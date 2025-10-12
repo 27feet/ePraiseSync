@@ -2,20 +2,9 @@
 
 namespace App\Jobs;
 
-use DateTime;
-use Carbon\Carbon;
-use App\Models\Point;
-use App\Models\Course;
-use App\Models\Demerit;
-use App\Models\Student;
-use App\Models\Teacher;
-use Arbor\Model\Hydrator;
-use App\Models\ArborClass;
-use App\Models\ArborStaff;
 use App\Models\Intervention;
-use App\Models\ArborPointCategory;
-use App\Models\EpraisePointCategory;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
@@ -25,69 +14,170 @@ class DeleteIntervention implements ShouldQueue
 
     protected Intervention $intervention;
 
-    /**
-     * Create a new job instance.
-     */
     public function __construct(string $interventionID)
     {
-        $this->intervention = Intervention::where('id', $interventionID)->first();
+        $this->intervention = Intervention::where('id', $interventionID)->firstOrFail();
     }
 
-    /**
-     * Execute the job.
-     */
-    public function handle(): void
+    public function handle(): int
     {
+        $writeCount = 0;
 
-        if (!$this->intervention) {
-            return;
-        } else {
-            $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-            $authstring = base64_encode($authtmp);
-            $action_ids = $this->intervention->arbor_action_id;
-            if (!$action_ids) {
-            } else {
-                foreach ($action_ids as $action_id) {
-                    Http::withHeaders([
-                        'Authorization' => 'Basic ' . $authstring,
-                        'Content-Type' => 'application/json',
-                    ])->delete(
-                        'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Action/' . $action_id,
-                    );
-                };
-            };
+        $client = Http::baseUrl(config('services.arbor.base_url'))
+            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
+            ->acceptJson()
+            ->asJson();
 
-            if (!$this->intervention->arbor_behaviour_student_id) {
-            } else {
-                Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->delete(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Student-Involvement/' . $this->intervention->arbor_behaviour_student_id,
-                );
-            };
+        // ---------- Normalize action IDs into an associative array ----------
+        $raw = $this->intervention->arbor_action_id;
+        $actions = [];
 
-            if (!$this->intervention->arbor_behaviour_id) {
-            } else {
-                Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->delete(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident/' . $this->intervention->arbor_behaviour_id,
-                );
-            };
-
-            if (!$this->intervention->arbor_point_id) {
-            } else {
-                Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->delete(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Point-Award/' . $this->intervention->arbor_point_id,
-                );
-            };
-
-            $this->intervention->delete();
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $actions = $decoded;
+            }
+        } elseif ($raw instanceof \Illuminate\Support\Collection) {
+            $actions = $raw->toArray();
+        } elseif (is_array($raw)) {
+            $actions = $raw;
         }
+
+        // Ensure we have a key->id map; if it's a plain list, map numeric keys to stable labels
+        if (array_values($actions) === $actions) {
+            // plain numeric array, lift to stable keys
+            $tmp = [];
+            foreach ($actions as $idx => $val) {
+                $tmp['action' . $idx] = $val;
+            }
+            $actions = $tmp;
+        }
+
+        // Make a working copy we will mutate as we delete successfully
+        $remainingActions = $actions;
+
+        // Helper: treat 2xx/404/410 as "ok"
+        $ok = fn($res) => $res->successful() || in_array($res->status(), [404, 410], true);
+
+        // Track outcomes (assume true if there is nothing to delete)
+        $actionsDeleted     = empty(array_filter($actions)); // all empty means nothing to delete
+        $involvementDeleted = !$this->intervention->arbor_behaviour_student_id;
+        $incidentDeleted    = !$this->intervention->arbor_behaviour_id;
+        $pointDeleted       = !$this->intervention->arbor_point_id;
+
+        // ---------- Delete each behavioural incident action ----------
+        foreach ($actions as $label => $id) {
+            if (!$id) {
+                continue;
+            }
+            $res = $client->delete('/rest-v2/behavioural-incident-actions/' . $id);
+            $writeCount++;
+
+            if ($ok($res)) {
+                // clear only this one
+                $remainingActions[$label] = null;
+            } else {
+                $actionsDeleted = false;
+                Log::warning('DeleteIntervention: delete behavioural-incident-action failed', [
+                    'intervention_id' => $this->intervention->id,
+                    'action_key'      => $label,
+                    'action_id'       => $id,
+                    'status'          => $res->status(),
+                    'body'            => $res->body(),
+                ]);
+            }
+        }
+
+        // After per-action deletes, if all are now null/empty, consider actions deleted
+        if (!empty($actions)) {
+            $anyLeft = false;
+            foreach ($remainingActions as $v) {
+                if (!empty($v)) {
+                    $anyLeft = true;
+                    break;
+                }
+            }
+            $actionsDeleted = !$anyLeft;
+        }
+
+        // ---------- Delete student involvement ----------
+        if ($this->intervention->arbor_behaviour_student_id) {
+            $res = $client->delete('/rest-v2/behavioural-incident-student-involvements/' . $this->intervention->arbor_behaviour_student_id);
+            $writeCount++;
+
+            if ($ok($res)) {
+                $involvementDeleted = true;
+            } else {
+                Log::warning('DeleteIntervention: delete behavioural-incident-student-involvement failed', [
+                    'intervention_id' => $this->intervention->id,
+                    'involvement_id'  => $this->intervention->arbor_behaviour_student_id,
+                    'status'          => $res->status(),
+                    'body'            => $res->body(),
+                ]);
+            }
+        }
+
+        // ---------- Delete behavioural incident ----------
+        if ($this->intervention->arbor_behaviour_id) {
+            $res = $client->delete('/rest-v2/behavioural-incidents/' . $this->intervention->arbor_behaviour_id);
+            $writeCount++;
+
+            if ($ok($res)) {
+                $incidentDeleted = true;
+            } else {
+                Log::warning('DeleteIntervention: delete behavioural-incident failed', [
+                    'intervention_id' => $this->intervention->id,
+                    'behaviour_id'    => $this->intervention->arbor_behaviour_id,
+                    'status'          => $res->status(),
+                    'body'            => $res->body(),
+                ]);
+            }
+        }
+
+        // ---------- Delete point award ----------
+        if ($this->intervention->arbor_point_id) {
+            $res = $client->delete('/rest-v2/point-awards/' . $this->intervention->arbor_point_id);
+            $writeCount++;
+
+            if ($ok($res)) {
+                $pointDeleted = true;
+            } else {
+                Log::warning('DeleteIntervention: delete point-award failed', [
+                    'intervention_id' => $this->intervention->id,
+                    'point_id'        => $this->intervention->arbor_point_id,
+                    'status'          => $res->status(),
+                    'body'            => $res->body(),
+                ]);
+            }
+        }
+
+        // ---------- Finalize: clear only what actually deleted ----------
+        // Prepare cleaned actions payload (null if none left)
+        $cleanRemaining = [];
+        foreach ($remainingActions as $k => $v) {
+            if (!empty($v)) {
+                $cleanRemaining[$k] = $v;
+            }
+        }
+        $finalActions = empty($cleanRemaining) ? null : $cleanRemaining;
+
+        $syncStatus =  ($actionsDeleted && $involvementDeleted && $incidentDeleted && $pointDeleted)
+            ? Intervention::STATUS_DELETED
+            : Intervention::STATUS_PARTIALLY_DELETED;
+
+        if ($syncStatus === Intervention::STATUS_DELETED) {
+            // If everything deleted, we can remove the record entirely
+            $this->intervention->delete();
+        } else {
+            $this->intervention->forceFill([
+                'arbor_action_id'            => $finalActions,
+                'arbor_behaviour_student_id' => $involvementDeleted ? null : $this->intervention->arbor_behaviour_student_id,
+                'arbor_behaviour_id'         => $incidentDeleted    ? null : $this->intervention->arbor_behaviour_id,
+                'arbor_point_id'             => $pointDeleted       ? null : $this->intervention->arbor_point_id,
+                'sync_status'                => $syncStatus,
+                'synced_at'                  => now(),
+            ])->save();
+        }
+        return $writeCount;
     }
 }

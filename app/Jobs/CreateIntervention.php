@@ -2,148 +2,128 @@
 
 namespace App\Jobs;
 
-use DateTime;
 use Carbon\Carbon;
-use App\Models\Course;
-use App\Models\Demerit;
 use App\Models\Student;
 use App\Models\Teacher;
-use Arbor\Model\Hydrator;
-use App\Models\ArborClass;
 use App\Models\ArborStaff;
-use Arbor\Model\ModelBase;
 use App\Models\Intervention;
 use App\Models\ArborPointCategory;
-use App\Models\EpraisePointCategory;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
-use App\Models\EpraiseDemeritCategory;
-use Illuminate\Foundation\Queue\Queueable;
 use App\Models\EpraiseInterventionCategory;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
 
 class CreateIntervention implements ShouldQueue
 {
-    use Queueable;
+    use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Intervention $intervention;
 
-    /**
-     * Create a new job instance.
-     */
     public function __construct(string $interventionID)
     {
-        $this->intervention = Intervention::where('id', $interventionID)->first();
+        $this->intervention = Intervention::where('id', $interventionID)->firstOrFail();
     }
 
-    /**
-     * Execute the job.
-     */
-    public function handle(): void
+    public function handle(): int
     {
+        $writeCount = 0;
 
-        $behaviourActionID = null;
-        $behaviourID = null;
-        $pointID = null;
-        $matchedTeacher = true;
-        $matchedClass = true;
-        date_default_timezone_set('Europe/London');
-        $data = Intervention::where('record_id', $this->intervention->record_id)
-            ->firstOrFail()
-            ->toArray();
-        $stuID = Student::where('record_id', $data['student_id'])
-            ->pluck('arbor_id')
-            ->first();
-        $teacherEmail = Teacher::where('record_id', $data['teacher_id'])
-            ->pluck('email')
-            ->first();
-        $teacherID = ArborStaff::where('email', $teacherEmail)
-            ->pluck('arbor_id')
-            ->first();
-
-        $linkedDemerit = Demerit::where('record_id', $data['demerit_id'])
-            ->first();
-        $internalReference = EpraiseInterventionCategory::where('epraise_name', $data['intervention_type'])
-            ->first();
-        $pointCategory = ArborPointCategory::where('id', $internalReference->arbor_point_category_id)
-            ->pluck('arbor_id')
-            ->first();
-        $behaviourCategory = ArborBehaviourCategory::where('id', $internalReference->arbor_behaviour_category_id)
-            ->first();
-        $linkedDemerit = Demerit::where('record_id', $data['demerit_id'])
-            ->first();
-        if (!$linkedDemerit) {
-            $eventID = null;
-        } else {
-            $className = Course::where('course_id', $linkedDemerit['class_id'])
-                ->pluck('course_name')
-                ->first();
-            $eventID = ArborClass::where('name', $className)
-                ->where('start_date_time', '<=', Carbon::parse($data['date_added'])->setTimezone('Europe/London'))
-                ->orderBy('start_date_time', 'desc')
-                ->pluck('arbor_id')
-                ->first();
+        // Idempotency: if already synced, bail out
+        if ($this->intervention->arbor_point_id || $this->intervention->arbor_behaviour_id) {
+            return 0;
         }
 
-        $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-        $authstring = base64_encode($authtmp);
+        // Proceed only when "ready" (mirrors your Demerit pattern)
+        if ($this->intervention->sync_status == Intervention::STATUS_READY_TO_CREATE) {
+            // Pre-mark as failed as your signal "attempting" (kept)
+            $this->intervention['sync_status'] = Intervention::STATUS_FAILED_CREATION;
+            $this->intervention->save();
 
-        if (!$stuID) {
-        } else {
-            if (!$pointCategory) {
-            } else {
-                $pointScale = ArborPointCategory::where('id', $internalReference->arbor_point_category_id)
-                    ->first()
-                    ->ArborPointScale()
-                    ->pluck('arbor_id')
-                    ->first();
+            $client = Http::baseUrl(config('services.arbor.base_url'))
+                ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
+                ->acceptJson()
+                ->asJson();
 
-                $correctDateTime = Carbon::parse(new DateTime($data['date_added']))->setTimezone('Europe/London')->toDateTimeString();
+            $behaviourAction1ID = null;
+            $behaviourAction2ID = null;
+            $behaviourID = null;
+            $pointID = null;
 
-                $restArray = [
+            // Flags: no session/event in this flow, so class is never matched
+            $matchedTeacher = true;
+            $matchedClass = false;
+
+            // Resolve core references
+            $stuID = Student::where('record_id', $this->intervention->student_id)->value('arbor_id');
+
+            $teacherEmail = Teacher::where('record_id', $this->intervention->teacher_id)->value('email');
+            $teacherEmail = $teacherEmail ? mb_strtolower($teacherEmail) : null;
+            $teacherID = $teacherEmail
+                ? ArborStaff::whereRaw('LOWER(email) = ?', [$teacherEmail])->value('arbor_id')
+                : null;
+
+            // Intervention category mapping (required)
+            $internalReference = EpraiseInterventionCategory::where('epraise_name', $this->intervention->intervention_type)
+                ->firstOrFail();
+
+            // Early guard: missing student
+            if (!$stuID) {
+                $this->intervention->forceFill([
+                    'sync_status'     => Intervention::STATUS_FAILED_CREATION,
+                    'synced_at'       => now(),
+                    'matched_teacher' => false,
+                    'matched_class'   => false,
+                ])->save();
+                return $writeCount;
+            }
+
+            // =========================
+            // Point Award (if mapped)
+            // =========================
+            if ($internalReference->arbor_point_category_id) {
+                $pointCategory = ArborPointCategory::findOrFail($internalReference->arbor_point_category_id);
+                $pointScale = $pointCategory->ArborPointScale()->value('arbor_id');
+
+                $awardedAt = Carbon::parse($this->intervention->date_added)->toDateTimeString();
+
+                $pointPayload = [
                     'request' => [
                         'pointAward' => [
                             'student' => [
                                 'entityType' => 'Student',
-                                'href' => '/rest-v2/students/' . $stuID
+                                'href'       => '/rest-v2/students/' . $stuID
                             ],
                             'pointAwardScale' => [
                                 'entityType' => 'PointAwardScale',
-                                'href' => '/rest-v2/point-award-scales/' . $pointScale
+                                'href'       => '/rest-v2/point-award-scales/' . $pointScale
                             ],
                             'pointAwardCategory' => [
                                 'entityType' => 'PointAwardCategory',
-                                'href' => '/rest-v2/point-award-categories/' . $pointCategory
+                                'href'       => '/rest-v2/point-award-categories/' . $pointCategory->arbor_id
                             ],
-                            'event' => [
-                                'entityType' => 'Session',
-                                'href' => '/rest-v2/sessions/' . $eventID
-                            ],
-                            'awardedByStaff' => [
+                            // No event in interventions
+                            'awardedByStaff' => $teacherID ? [
                                 'entityType' => 'Staff',
-                                'href' => '/rest-v2/staffs/' . $teacherID
-                            ],
-                            'points' => $internalReference->default_points,
-                            'awardedDatetime' => $correctDateTime
+                                'href'       => '/rest-v2/staffs/' . $teacherID
+                            ] : null,
+                            'points'          => $internalReference->default_points,
+                            'awardedDatetime' => $awardedAt,
                         ]
                     ]
                 ];
-                if (!$eventID) {
-                    unset($restArray['request']['pointAward']['event']);
-                    $matchedClass = false;
-                }
+
+                // if no teacher, drop awardedByStaff and mark flag
                 if (!$teacherID) {
-                    unset($restArray['request']['pointAward']['awardedByStaff']);
+                    unset($pointPayload['request']['pointAward']['awardedByStaff']);
                     $matchedTeacher = false;
                 }
 
-                $pointResponse = Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->post(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Point-Award',
-                    $restArray
-                );
+                $pointResponse = $client->post('/rest-v2/point-awards', $pointPayload);
+                $writeCount++;
 
                 if ($pointResponse->successful()) {
                     $pointData = $pointResponse->json();
@@ -151,238 +131,235 @@ class CreateIntervention implements ShouldQueue
                         ->after('/rest-v2/point-awards/')
                         ->toInteger();
                     $this->intervention['arbor_point_id'] = $pointID;
+                } else {
+                    Log::warning('Arbor point-awards failed (interventions)', [
+                        'intervention_id' => $this->intervention->id,
+                        'status'          => $pointResponse->status(),
+                        'body'            => $pointResponse->body(),
+                        'payload'         => $pointPayload,
+                    ]);
+                }
+            }
+
+            // ==================================
+            // Behavioural Incident (if mapped)
+            // ==================================
+            if ($internalReference->arbor_behaviour_category_id) {
+                $behaviourCategory = ArborBehaviourCategory::findOrFail($internalReference->arbor_behaviour_category_id);
+
+                $incidentAt = Carbon::parse($this->intervention->date_added)->toDateTimeString();
+
+                $behaviourPayload = [
+                    'request' => [
+                        'behaviouralIncident' => [
+                            'behaviour' => [
+                                'entityType' => 'Behaviour',
+                                // If Arbor expects singular (/behaviour/{id}), change here
+                                'href'       => '/rest-v2/behaviours/' . $behaviourCategory->arbor_id,
+                            ],
+                            'loggedByStaff' => $teacherID ? [
+                                'entityType' => 'Staff',
+                                'href'       => '/rest-v2/staffs/' . $teacherID,
+                            ] : null,
+                            'narrative'        => $this->intervention->comment,
+                            'incidentDatetime' => $incidentAt,
+                            'resolvedDatetime' => $incidentAt,
+                            'severity'         => $behaviourCategory->severity,
+                        ]
+                    ]
+                ];
+
+                if (!$teacherID) {
+                    $matchedTeacher = false;
+                    unset($behaviourPayload['request']['behaviouralIncident']['loggedByStaff']);
                 }
 
-                if ((is_null($internalReference->arbor_behaviour_category_id) || !$internalReference->arbor_behaviour_category_id)) {
-                } else {
-                    $behaviourArray = [
+                $behaviourResponse = $client->post('/rest-v2/behavioural-incidents', $behaviourPayload);
+                $writeCount++;
+
+                if ($behaviourResponse->successful()) {
+                    $behaviourData = $behaviourResponse->json();
+                    $behaviourID = str($behaviourData['behaviouralIncident']['href'])
+                        ->after('/rest-v2/behavioural-incidents/')
+                        ->toInteger();
+                    $this->intervention['arbor_behaviour_id'] = $behaviourID;
+
+                    // -----------------------------------
+                    // Student involvement (required link)
+                    // -----------------------------------
+                    $involvementPayload = [
                         'request' => [
-                            'behaviouralIncident' => [
-                                'behaviour' => [
-                                    'entityType' => 'Behaviour',
-                                    'href' => '/rest-v2/behaviour/' . $behaviourCategory->arbor_id,
+                            'behaviouralIncidentStudentInvolvement' => [
+                                'behaviouralIncident' => [
+                                    'entityType' => 'BehaviouralIncident',
+                                    'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
                                 ],
-                                'loggedByStaff' => [
+                                'student' => [
+                                    'entityType' => 'Student',
+                                    'href'       => '/rest-v2/students/' . $stuID
+                                ],
+                                'assignee' => $teacherID ? [
                                     'entityType' => 'Staff',
-                                    'href' => '/rest-v2/staffs/' . $teacherID,
-                                ],
-                                'event' => [
-                                    'entityType' => 'Session',
-                                    'href' => '/rest-v2/sessions/' . $eventID
-                                ],
-                                'narrative' => $data['comment'],
-                                'incidentDatetime' => Carbon::parse($data['date_added'])->setTimezone('Europe/London')->toDateTimeString(),
-                                'resolvedDatetime' => Carbon::parse($data['date_added'])->setTimezone('Europe/London')->toDateTimeString(),
-                                'severity' => $behaviourCategory->severity,
+                                    'href'       => '/rest-v2/staffs/' . $teacherID,
+                                ] : null,
+                                'resolvedDatetime' => $incidentAt,
+                                'severity'         => $behaviourCategory->severity,
                             ]
                         ]
                     ];
-
-
-                    if (!$eventID) {
-                        unset($behaviourArray['request']['behaviouralIncident']['event']);
-                        $matchedClass = false;
-                    }
                     if (!$teacherID) {
-                        unset($behaviourArray['request']['behaviouralIncident']['loggedByStaff']);
-                        $matchedTeacher = false;
+                        unset($involvementPayload['request']['behaviouralIncidentStudentInvolvement']['assignee']);
                     }
 
-                    $behaviourResponse = Http::withHeaders([
-                        'Authorization' => 'Basic ' . $authstring,
-                        'Content-Type' => 'application/json',
-                    ])->post(
-                        'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident',
-                        $behaviourArray
-                    );
+                    $behaviourStuResponse = $client->post('/rest-v2/behavioural-incident-student-involvements', $involvementPayload);
+                    $writeCount++;
 
-                    if ($behaviourResponse->successful()) {
-                        $behaviourData = $behaviourResponse->json();
-                        $behaviourID = str($behaviourData['behaviouralIncident']['href'])
-                            ->after('/rest-v2/behavioural-incidents/')
+                    if ($behaviourStuResponse->successful()) {
+                        $behaviourStuData = $behaviourStuResponse->json();
+                        $this->intervention['arbor_behaviour_student_id'] = str($behaviourStuData['behaviouralIncidentStudentInvolvement']['href'])
+                            ->after('/rest-v2/behavioural-incident-student-involvements/')
                             ->toInteger();
-                        $this->intervention['arbor_behaviour_id'] = $behaviourID;
 
-                        $behaviourStuArray = [
-                            'request' => [
-                                'behaviouralIncidentStudentInvolvement' => [
-                                    'behaviouralIncident' => [
-                                        'entityType' => 'BehaviouralIncident',
-                                        'href' => '/rest-v2/behavioural-incident/' . $behaviourID
-                                    ],
-                                    'student' => [
-                                        'entityType' => 'Student',
-                                        'href' => '/rest-v2/students/' . $stuID
-                                    ],
-                                    'assignee' => [
-                                        'entityType' => 'Staff',
-                                        'href' => '/rest-v2/staffs/' . $teacherID,
-                                    ],
-                                    'resolvedDatetime' => Carbon::parse($data['date_added'])->setTimezone('Europe/London')->toDateTimeString(),
-                                    'severity' => $behaviourCategory->severity,
+                        // -----------------------------
+                        // Actions (save their IDs)
+                        // -----------------------------
+
+                        // Link incident -> PointAward (if we created one)
+                        if ($pointID) {
+                            $actionPointPayload = [
+                                'request' => [
+                                    'behaviouralIncidentAction' => [
+                                        'behaviouralIncident' => [
+                                            'entityType' => 'BehaviouralIncident',
+                                            'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
+                                        ],
+                                        'action' => [
+                                            'entityType' => 'PointAward',
+                                            'href'       => '/rest-v2/point-awards/' . $pointID,
+                                        ],
+                                        'student' => [
+                                            'entityType' => 'Student',
+                                            'href'       => '/rest-v2/students/' . $stuID
+                                        ],
+                                        'isAutomatic' => 'true',
+                                    ]
                                 ]
-                            ]
-                        ];
-
-                        if (!$teacherID) {
-                            unset($behaviourStuArray['request']['behaviouralIncidentStudentInvolvement']['assignee']);
-                            $matchedTeacher = false;
-                        }
-
-                        $behaviourStuResponse = Http::withHeaders([
-                            'Authorization' => 'Basic ' . $authstring,
-                            'Content-Type' => 'application/json',
-                        ])->post(
-                            'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Student-Involvement',
-                            $behaviourStuArray
-                        );
-
-                        if ($behaviourStuResponse->successful()) {
-                            $behaviourStuData = $behaviourStuResponse->json();
-                            $this->intervention['arbor_behaviour_student_id'] = str($behaviourStuData['behaviouralIncidentStudentInvolvement']['href'])
-                                ->after('/rest-v2/behavioural-incident-student-involvements/')
-                                ->toInteger();
-
-                            if (!$pointID) {
-                            } else {
-
-                                $behaviourAction2Array = [
-                                    'request' => [
-                                        'behaviouralIncidentAction' => [
-                                            'behaviouralIncident' => [
-                                                'entityType' => 'BehaviouralIncident',
-                                                'href' => '/rest-v2/behavioural-incident/' . $behaviourID
-                                            ],
-                                            'action' => [
-                                                'entityType' => 'PointAward',
-                                                'href' => '/rest-v2/point-awards/' . $pointID,
-                                            ],
-                                            'student' => [
-                                                'entityType' => 'Student',
-                                                'href' => '/rest-v2/students/' . $stuID
-                                            ],
-                                            'isAutomatic' => 'true',
-                                        ]
-                                    ]
-                                ];
-
-                                $behaviourAction2Response = Http::withHeaders([
-                                    'Authorization' => 'Basic ' . $authstring,
-                                    'Content-Type' => 'application/json',
-                                ])->post(
-                                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Action',
-                                    $behaviourAction2Array
-                                );
-
-                                if ($behaviourAction2Response->successful()) {
-                                    $behaviourStuData = $behaviourStuResponse->json();
-                                    $behaviourAction2Data = $behaviourAction2Response->json();
-                                    $behaviourAction2ID = str($behaviourAction2Data['behaviouralIncidentAction']['href'])
-                                        ->after('/rest-v2/behavioural-incident-actions/')
-                                        ->toInteger();
-                                }
-                            }
-                            if (!$teacherID) {
-                            } else {
-
-                                $behaviourAction1Array = [
-                                    'request' => [
-                                        'behaviouralIncidentAction' => [
-                                            'behaviouralIncident' => [
-                                                'entityType' => 'BehaviouralIncident',
-                                                'href' => '/rest-v2/behavioural-incident/' . $behaviourID
-                                            ],
-                                            'action' => [
-                                                'entityType' => 'Staff',
-                                                'href' => '/rest-v2/staffs/' . $teacherID,
-                                            ],
-                                            'student' => [
-                                                'entityType' => 'Student',
-                                                'href' => '/rest-v2/students/' . $stuID
-                                            ],
-                                            'isAutomatic' => 'true',
-                                        ]
-                                    ]
-                                ];
-
-                                $behaviourAction1Response = Http::withHeaders([
-                                    'Authorization' => 'Basic ' . $authstring,
-                                    'Content-Type' => 'application/json',
-                                ])->post(
-                                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Action',
-                                    $behaviourAction1Array
-                                );
-
-                                if ($behaviourAction1Response->successful()) {
-                                    $behaviourStuData = $behaviourStuResponse->json();
-                                    $behaviourAction1Data = $behaviourAction1Response->json();
-                                    $behaviourAction1ID = str($behaviourAction1Data['behaviouralIncidentAction']['href'])
-                                        ->after('/rest-v2/behavioural-incident-actions/')
-                                        ->toInteger();
-                                }
-                            }
-                            $behaviourActionID = [
-                                'behaviourAction1' => $behaviourAction1ID ?? null,
-                                'behaviourAction2' => $behaviourAction2ID ?? null,
                             ];
-                            $this->intervention['arbor_action_id'] = $behaviourActionID;
+
+                            $behaviourAction2Response = $client->post('/rest-v2/behavioural-incident-actions', $actionPointPayload);
+                            $writeCount++;
+
+                            if ($behaviourAction2Response->successful()) {
+                                $behaviourAction2Data = $behaviourAction2Response->json();
+                                $behaviourAction2ID = str($behaviourAction2Data['behaviouralIncidentAction']['href'])
+                                    ->after('/rest-v2/behavioural-incident-actions/')
+                                    ->toInteger();
+                            } else {
+                                Log::warning('Arbor behavioural-incident-action (PointAward) failed (interventions)', [
+                                    'intervention_id' => $this->intervention->id,
+                                    'status'          => $behaviourAction2Response->status(),
+                                    'body'            => $behaviourAction2Response->body(),
+                                    'payload'         => $actionPointPayload,
+                                ]);
+                            }
                         }
+
+                        // Link incident -> Staff (if we have a teacher)
+                        if ($teacherID) {
+                            $actionStaffPayload = [
+                                'request' => [
+                                    'behaviouralIncidentAction' => [
+                                        'behaviouralIncident' => [
+                                            'entityType' => 'BehaviouralIncident',
+                                            'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
+                                        ],
+                                        'action' => [
+                                            'entityType' => 'Staff',
+                                            'href'       => '/rest-v2/staffs/' . $teacherID,
+                                        ],
+                                        'student' => [
+                                            'entityType' => 'Student',
+                                            'href'       => '/rest-v2/students/' . $stuID
+                                        ],
+                                        'isAutomatic' => 'true',
+                                    ]
+                                ]
+                            ];
+
+                            $behaviourAction1Response = $client->post('/rest-v2/behavioural-incident-actions', $actionStaffPayload);
+                            $writeCount++;
+
+                            if ($behaviourAction1Response->successful()) {
+                                $behaviourAction1Data = $behaviourAction1Response->json();
+                                $behaviourAction1ID = str($behaviourAction1Data['behaviouralIncidentAction']['href'])
+                                    ->after('/rest-v2/behavioural-incident-actions/')
+                                    ->toInteger();
+                            } else {
+                                Log::warning('Arbor behavioural-incident-action (Staff) failed (interventions)', [
+                                    'intervention_id' => $this->intervention->id,
+                                    'status'          => $behaviourAction1Response->status(),
+                                    'body'            => $behaviourAction1Response->body(),
+                                    'payload'         => $actionStaffPayload,
+                                ]);
+                            }
+                        }
+
+                        // Persist action IDs (can be null if not created)
+                        $this->intervention['arbor_action_id'] = [
+                            'behaviourAction1' => $behaviourAction1ID,
+                            'behaviourAction2' => $behaviourAction2ID,
+                        ];
                     } else {
+                        // Failed to link student -> clean up incident
                         $this->intervention['arbor_behaviour_id'] = null;
-                        $response = Http::withHeaders([
-                            'Authorization' => 'Basic ' . $authstring,
-                            'Content-Type' => 'application/json',
-                        ])->delete(
-                            'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident/' . $behaviourID,
-                        );
+
+                        Log::warning('Arbor behavioural-incident-student-involvements failed (interventions)', [
+                            'intervention_id' => $this->intervention->id,
+                            'status'          => $behaviourStuResponse->status(),
+                            'body'            => $behaviourStuResponse->body(),
+                            'payload'         => $involvementPayload,
+                        ]);
+
+                        $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                        if (!$response->successful()) {
+                            Log::warning('Arbor delete behavioural-incident failed (interventions)', [
+                                'intervention_id' => $this->intervention->id,
+                                'status'          => $response->status(),
+                                'body'            => $response->body(),
+                            ]);
+                        }
                         $behaviourID = null;
                     }
-
-
-
-                    $restArray5 = [
-                        'request' => [
-                            'userNotification' => [
-                                'user' => [
-                                    'entityType' => 'User',
-                                    'href' => '/rest-v2/user/5471'
-                                ],
-                                'isRead' => false,
-                                'action' => 'loadPage',
-                                'status' => 'NEW',
-                                'type' => 1,
-                                'description' => 'New Demerit for BOBOBOB',
-                                'subject' => 'LOOK HERE NOW',
-                                'icon' => 'warning_black',
-                                'parameters' => [
-                                    'url' => '/behavioural-incident-ui/overview/id/' . $behaviourID,
-                                ],
-
-                            ]
-                        ]
-                    ];
-
-                    $response5 = Http::withHeaders([
-                        'Authorization' => 'Basic ' . $authstring,
-                        'Content-Type' => 'application/json',
-                    ])->post(
-                        'https://api-sandbox2.uk.arbor.sc/rest-v2/User-Notification',
-                        $restArray5
-                    );
-
-                    $data = $response5->json();
+                } else {
+                    Log::warning('Arbor behavioural-incidents failed (interventions)', [
+                        'intervention_id' => $this->intervention->id,
+                        'status'          => $behaviourResponse->status(),
+                        'body'            => $behaviourResponse->body(),
+                        'payload'         => $behaviourPayload,
+                    ]);
                 }
             }
 
-            if (!$behaviourID && !$pointID) {
+            // ========================
+            // Finalisation (always)
+            // ========================
+            if ($behaviourID || $pointID) {
+                $this->intervention->forceFill([
+                    'synced_at'       => now(),
+                    'sync_status'     => Intervention::STATUS_PROCESSED_SUCCESSFULLY,
+                    'matched_teacher' => (bool) $teacherID,
+                    'matched_class'   => false,
+                ])->save();
             } else {
-
-                $this->intervention['synced_at'] = Carbon::parse(now())->toDateTimeString();
-                $this->intervention['sync_status'] = 1;
-                $this->intervention['matched_teacher'] = $matchedTeacher;
-                $this->intervention['matched_class'] = $matchedClass;
-                $this->intervention->save();
+                $this->intervention->forceFill([
+                    'synced_at'       => now(),
+                    'sync_status'     => Intervention::STATUS_FAILED_CREATION,
+                    'matched_teacher' => (bool) $teacherID,
+                    'matched_class'   => false,
+                ])->save();
             }
         }
+
+        return $writeCount;
     }
 }

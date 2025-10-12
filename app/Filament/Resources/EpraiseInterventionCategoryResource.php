@@ -62,7 +62,7 @@ class EpraiseInterventionCategoryResource extends Resource
                     ->searchable(),
                 Tables\Columns\SelectColumn::make('arbor_behaviour_category_id')
                     ->label('Arbor Behaviour Category')
-                    ->options(ArborBehaviourCategory::all()->pluck('arbor_display_name', 'id')->sort())
+                    ->options(ArborBehaviourCategory::where('active', 1)->pluck('arbor_display_name', 'id')->sort())
                     ->sortable(),
             ])
             ->filters([

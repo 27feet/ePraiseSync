@@ -31,7 +31,7 @@ class AcademicCalendarDate extends Model
         'arbor_id' => 'integer',
         'academic_year_id' => 'integer',
         'term_id' => 'integer',
-        'date' => 'datetime',
+        'date' => 'date',
         'calendar_year' => 'integer',
         'calendar_month' => 'integer',
         'calendar_day' => 'integer',

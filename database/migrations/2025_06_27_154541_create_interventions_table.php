@@ -28,7 +28,7 @@ return new class extends Migration
             $table->string('arbor_behaviour_student_id')->nullable();
             $table->json('arbor_action_id')->nullable();
             $table->string('arbor_detention_id')->nullable();
-            $table->integer('sync_status')->default(0); // 0 = not synced, 1 = synced, -1 = delete
+            $table->integer('sync_status')->default(1);
             $table->boolean('matched_teacher')->default(false);
             $table->boolean('matched_class')->default(false);
         });

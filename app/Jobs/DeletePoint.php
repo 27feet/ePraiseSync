@@ -2,19 +2,9 @@
 
 namespace App\Jobs;
 
-use DateTime;
-use Carbon\Carbon;
 use App\Models\Point;
-use App\Models\Course;
-use App\Models\Student;
-use App\Models\Teacher;
-use Arbor\Model\Hydrator;
-use App\Models\ArborClass;
-use App\Models\ArborStaff;
-use Arbor\Model\ModelBase;
-use App\Models\ArborPointCategory;
-use App\Models\EpraisePointCategory;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
@@ -24,41 +14,68 @@ class DeletePoint implements ShouldQueue
 
     protected Point $point;
 
-    /**
-     * Create a new job instance.
-     */
     public function __construct(string $pointID)
     {
-        $this->point = Point::where('id', $pointID)->first();
+        $this->point = Point::where('id', $pointID)->firstOrFail();
     }
 
-    /**
-     * Execute the job.
-     */
-    public function handle(): void
+    public function handle(): int
     {
+        $writeCount = 0;
 
-        if (!$this->point) {
-            logger('Point not found for ID: ' . $this->point->id);
-            return;
-        } else {
-            $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-            $authstring = base64_encode($authtmp);
-            $response = Http::withHeaders([
-                'Authorization' => 'Basic ' . $authstring,
-                'Content-Type' => 'application/json',
-            ])->delete(
-                'https://api-sandbox2.uk.arbor.sc/rest-v2/Point-Award/' . $this->point->arbor_id,
-            );
-
-            if ($response->successful()) {
-                $this->point->delete();
-            } else {
-                $statusCode = $response->status();
-                $errorMessage = $response->body();
-                logger($statusCode);
-                logger($errorMessage);
-            }
+        // Status gate
+        if ($this->point->sync_status !== Point::STATUS_READY_TO_DELETE) {
+            return 0;
         }
+
+        // Pre-mark as failed delete (attempt signal)
+        $this->point->forceFill([
+            'sync_status' => Point::STATUS_FAILED_DELETION,
+        ])->save();
+
+        $client = Http::baseUrl(config('services.arbor.base_url'))
+            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
+            ->acceptJson()
+            ->asJson();
+
+        // If no remote ID, consider already deleted: mark locally and exit
+        if (!$this->point->arbor_id) {
+            $this->point->forceFill([
+                'synced_at'   => now(),
+                'sync_status' => Point::STATUS_DELETED,
+            ])->save();
+            return 0;
+        }
+
+        $res = $client->delete('/rest-v2/point-awards/' . $this->point->arbor_id);
+        $writeCount++;
+
+        if ($res->successful() || in_array($res->status(), [404, 410], true)) {
+            $this->point->delete();
+        } else {
+            if (in_array($res->status(), [401, 403], true)) {
+                Log::warning('DeletePoint: auth/permission error', [
+                    'point_id' => $this->point->id,
+                    'arbor_id' => $this->point->arbor_id,
+                    'status'   => $res->status(),
+                    'body'     => $res->body(),
+                ]);
+            } else {
+                Log::warning('DeletePoint: remote delete failed', [
+                    'point_id' => $this->point->id,
+                    'arbor_id' => $this->point->arbor_id,
+                    'status'   => $res->status(),
+                    'body'     => $res->body(),
+                ]);
+            }
+
+            // keep FAILED_DELETE + synced_at
+            $this->point->forceFill([
+                'synced_at'   => now(),
+                'sync_status' => Point::STATUS_FAILED_DELETION,
+            ])->save();
+        }
+
+        return $writeCount;
     }
 }

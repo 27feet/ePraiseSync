@@ -8,6 +8,19 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Point extends Model
 {
+    public const STATUS_REQUIRES_CREATE = 1;
+    public const STATUS_REQUIRES_DELETION = -1;
+    public const STATUS_REQUIRES_UPDATE = -2;
+    public const STATUS_READY_TO_DELETE = -10;
+    public const STATUS_READY_TO_UPDATE = -20;
+    public const STATUS_READY_TO_CREATE = 10;
+    public const STATUS_FAILED_DELETION = -11;
+    public const STATUS_FAILED_CREATION = 11;
+    public const STATUS_FAILED_UPDATE = -21;
+    public const STATUS_PROCESSED_SUCCESSFULLY = 0;
+    public const STATUS_DELETED = -100;
+    public const STATUS_PARTIALLY_DELETED = -101;
+    public const STATUS_PARTIALLY_UPDATED = -102;
     protected $fillable = [
 
         'record_id',

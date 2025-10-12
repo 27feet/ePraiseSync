@@ -2,19 +2,17 @@
 
 namespace App\Jobs;
 
-use DateTime;
 use Carbon\Carbon;
 use App\Models\Point;
 use App\Models\Course;
 use App\Models\Student;
 use App\Models\Teacher;
-use Arbor\Model\Hydrator;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
-use Arbor\Model\ModelBase;
 use App\Models\ArborPointCategory;
 use App\Models\EpraisePointCategory;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
@@ -24,130 +22,148 @@ class UpdatePoint implements ShouldQueue
 
     protected Point $point;
 
-    /**
-     * Create a new job instance.
-     */
     public function __construct(string $pointID)
     {
-        $this->point = Point::where('id', $pointID)->first();
+        $this->point = Point::where('id', $pointID)->firstOrFail();
     }
 
-    /**
-     * Execute the job.
-     */
-    public function handle(): void
+    public function handle(): int
     {
+        $writeCount = 0;
+
+        // Only proceed when explicitly ready to update
+        if ($this->point->sync_status !== Point::STATUS_READY_TO_UPDATE) {
+            return 0;
+        }
+
+        // Must have a remote ID to update
+        if (!$this->point->arbor_id) {
+            Log::warning('UpdatePoint: missing remote arbor_id; cannot update', [
+                'point_id' => $this->point->id,
+            ]);
+            $this->point->forceFill([
+                'synced_at'   => now(),
+                'sync_status' => Point::STATUS_FAILED_UPDATE,
+            ])->save();
+            return 0;
+        }
+
+        // Pre-mark as failed (attempt in progress)
+        $this->point->forceFill([
+            'sync_status' => Point::STATUS_FAILED_UPDATE,
+        ])->save();
+
+        $client = Http::baseUrl(config('services.arbor.base_url'))
+            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
+            ->acceptJson()
+            ->asJson();
 
         $matchedTeacher = true;
-        $matchedClass = true;
-        date_default_timezone_set('Europe/London');
+        $matchedClass   = true;
 
-        $data = Point::where('record_id', $this->point->record_id)
-            ->firstOrFail()
-            ->toArray();
-        $stuID = Student::where('record_id', $data['student_id'])
-            ->pluck('arbor_id')
-            ->first();
-        $teacherEmail = Teacher::where('record_id', $data['teacher_id'])
-            ->pluck('email')
-            ->first();
-        $teacherID = ArborStaff::where('email', $teacherEmail)
-            ->pluck('arbor_id')
-            ->first();
-        $arborID = $this->point->arbor_id;
+        // Resolve references
+        $stuID = Student::where('record_id', $this->point->student_id)->value('arbor_id');
 
-        if (!$stuID || !$arborID) {
-        } else {
+        $teacherEmail = Teacher::where('record_id', $this->point->teacher_id)->value('email');
+        $teacherEmail = $teacherEmail ? mb_strtolower($teacherEmail) : null;
+        $teacherID = $teacherEmail
+            ? ArborStaff::whereRaw('LOWER(email) = ?', [$teacherEmail])->value('arbor_id')
+            : null;
 
-            $internalReference = EpraisePointCategory::where('epraise_name', $data['category'])
-                ->pluck('arbor_point_category_id')
-                ->first();
+        // Mapping (required)
+        $internalReferenceId = EpraisePointCategory::where('epraise_name', $this->point->category)
+            ->value('arbor_point_category_id');
+        $pointCategory = ArborPointCategory::findOrFail($internalReferenceId);
 
-            $pointCategory = ArborPointCategory::where('id', $internalReference)
-                ->pluck('arbor_id')
-                ->first();
-
-            if (!$pointCategory) {
-            } else {
-
-                $pointScale = ArborPointCategory::where('id', $internalReference)
-                    ->first()
-                    ->ArborPointScale()
-                    ->pluck('arbor_id')
-                    ->first();
-
-                $className = Course::where('course_id', $data['class_id'])
-                    ->pluck('course_name')
-                    ->first();
-
-                $eventID = ArborClass::where('name', $className)
-                    ->where('start_date_time', '<=', Carbon::parse($data['date'])->setTimezone('Europe/London'))
-                    ->orderBy('start_date_time', 'desc')
-                    ->pluck('arbor_id')
-                    ->first();
-
-                $correctDateTime = Carbon::parse(new DateTime($data['date']))->setTimezone('Europe/London')->toDateTimeString();
-
-                $restArray = [
-                    'request' => [
-                        'pointAward' => [
-                            'student' => [
-                                'entityType' => 'Student',
-                                'href' => '/rest-v2/students/' . $stuID
-                            ],
-                            'pointAwardScale' => [
-                                'entityType' => 'PointAwardScale',
-                                'href' => '/rest-v2/point-award-scales/' . $pointScale
-                            ],
-                            'pointAwardCategory' => [
-                                'entityType' => 'PointAwardCategory',
-                                'href' => '/rest-v2/point-award-categories/' . $pointCategory
-                            ],
-                            'event' => [
-                                'entityType' => 'Session',
-                                'href' => '/rest-v2/sessions/' . $eventID
-                            ],
-                            'awardedByStaff' => [
-                                'entityType' => 'Staff',
-                                'href' => '/rest-v2/staffs/' . $teacherID
-                            ],
-                            'points' => $data['points'],
-                            'awardedDatetime' => $correctDateTime
-                        ]
-                    ]
-                ];
-                if (!$eventID) {
-                    unset($restArray['request']['pointAward']['event']);
-                    $matchedClass = false;
-                }
-                if (!$teacherID) {
-
-                    unset($restArray['request']['pointAward']['awardedByStaff']);
-                    $matchedTeacher = false;
-                }
-
-                $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-                $authstring = base64_encode($authtmp);
-                $response = Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->put(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Point-Award/' . $arborID,
-                    $restArray
-                );
-
-                if ($response->successful()) {
-                    $data = $response->json();
-                    $this->point['sync_status'] = 1;
-                    $this->point['synced_at'] = Carbon::parse(now())->toDateTimeString();
-                    $this->point['matched_teacher'] = $matchedTeacher;
-                    $this->point['matched_class'] = $matchedClass;
-                    $this->point->save();
-                } else {
-                    $statusCode = $response->status();
-                    $errorMessage = $response->body();
-                }
-            }
+        // Early guard: missing student
+        if (!$stuID) {
+            Log::warning('UpdatePoint: missing student Arbor ID; aborting', [
+                'point_id'          => $this->point->id,
+                'student_record_id' => $this->point->student_id,
+            ]);
+            $this->point->forceFill([
+                'synced_at'       => now(),
+                'sync_status'     => Point::STATUS_FAILED_UPDATE,
+                'matched_teacher' => false,
+                'matched_class'   => false,
+            ])->save();
+            return $writeCount;
         }
+
+        // Optional event
+        $className = Course::where('course_id', $this->point->class_id)->value('course_name');
+        $eventID   = ArborClass::where('name', $className)
+            ->where('start_date_time', '<=', Carbon::parse($this->point->date))
+            ->orderBy('start_date_time', 'desc')
+            ->value('arbor_id');
+
+        // Payload
+        $pointScale      = $pointCategory->ArborPointScale()->value('arbor_id');
+        $awardedDatetime = Carbon::parse($this->point->date)->toDateTimeString();
+
+        $payload = [
+            'request' => [
+                'pointAward' => [
+                    'student' => [
+                        'entityType' => 'Student',
+                        'href'       => '/rest-v2/students/' . $stuID
+                    ],
+                    'pointAwardScale' => [
+                        'entityType' => 'PointAwardScale',
+                        'href'       => '/rest-v2/point-award-scales/' . $pointScale
+                    ],
+                    'pointAwardCategory' => [
+                        'entityType' => 'PointAwardCategory',
+                        'href'       => '/rest-v2/point-award-categories/' . $pointCategory->arbor_id
+                    ],
+                    'event' => [
+                        'entityType' => 'Session',
+                        'href'       => '/rest-v2/sessions/' . $eventID
+                    ],
+                    'awardedByStaff' => [
+                        'entityType' => 'Staff',
+                        'href'       => '/rest-v2/staffs/' . $teacherID
+                    ],
+                    'points'          => (int) $this->point->points,
+                    'awardedDatetime' => $awardedDatetime,
+                ]
+            ]
+        ];
+
+        if (!$eventID) {
+            unset($payload['request']['pointAward']['event']);
+            $matchedClass = false;
+        }
+        if (!$teacherID) {
+            unset($payload['request']['pointAward']['awardedByStaff']);
+            $matchedTeacher = false;
+        }
+
+        // PUT update (plural endpoint)
+        $response = $client->put('/rest-v2/point-awards/' . $this->point->arbor_id, $payload);
+        $writeCount++;
+
+        if ($response->successful()) {
+            $this->point->forceFill([
+                'synced_at'       => now(),
+                'sync_status'     => Point::STATUS_PROCESSED_SUCCESSFULLY,
+                'matched_teacher' => $matchedTeacher,
+                'matched_class'   => $matchedClass,
+            ])->save();
+        } else {
+            Log::warning('UpdatePoint: point-awards update failed', [
+                'point_id' => $this->point->id,
+                'arbor_id' => $this->point->arbor_id,
+                'status'   => $response->status(),
+                'body'     => $response->body(),
+                'payload'  => $payload,
+            ]);
+            $this->point->forceFill([
+                'synced_at'   => now(),
+                'sync_status' => Point::STATUS_FAILED_UPDATE,
+            ])->save();
+        }
+
+        return $writeCount;
     }
 }

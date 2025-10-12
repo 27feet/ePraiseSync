@@ -8,170 +8,175 @@ use App\Models\Course;
 use App\Models\Demerit;
 use App\Models\Student;
 use App\Models\Teacher;
-use Arbor\Model\Hydrator;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
-use Arbor\Model\ModelBase;
 use App\Models\ArborPointCategory;
-use App\Models\EpraisePointCategory;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseDemeritCategory;
+use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
 
 class CreateDemerit implements ShouldQueue
 {
-    use Queueable;
+    use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Demerit $demerit;
 
-    /**
-     * Create a new job instance.
-     */
     public function __construct(string $demeritID)
     {
-        $this->demerit = Demerit::where('id', $demeritID)->first();
+        $this->demerit = Demerit::where('id', $demeritID)->firstOrFail();
     }
 
-    /**
-     * Execute the job.
-     */
-    public function handle(): void
+    public function handle(): int
     {
+        $writeCount = 0;
 
-        $behaviourActionID = null;
-        $behaviourID = null;
-        $pointID = null;
-        $matchedTeacher = true;
-        $matchedClass = true;
-        date_default_timezone_set('Europe/London');
-        $data = Demerit::where('record_id', $this->demerit->record_id)
-            ->firstOrFail()
-            ->toArray();
-        $stuID = Student::where('record_id', $data['student_id'])
-            ->pluck('arbor_id')
-            ->first();
-        $teacherEmail = Teacher::where('record_id', $data['teacher_id'])
-            ->pluck('email')
-            ->first();
-        $teacherID = ArborStaff::where('email', $teacherEmail)
-            ->pluck('arbor_id')
-            ->first();
-        $internalReference = EpraiseDemeritCategory::where('epraise_name', $data['category'])
-            ->first();
-        $pointCategory = ArborPointCategory::where('id', $internalReference->arbor_point_category_id)
-            ->pluck('arbor_id')
-            ->first();
-        $behaviourCategory = ArborBehaviourCategory::where('id', $internalReference->arbor_behaviour_category_id)
-            ->first();
-        $className = Course::where('course_id', $data['class_id'])
-            ->pluck('course_name')
-            ->first();
-        $eventID = ArborClass::where('name', $className)
-            ->where('start_date_time', '<=', Carbon::parse($data['date'])->setTimezone('Europe/London'))
-            ->orderBy('start_date_time', 'desc')
-            ->pluck('arbor_id')
-            ->first();
+        // Idempotency
+        if ($this->demerit->arbor_point_id || $this->demerit->arbor_behaviour_id) {
+            return 0; // already synced
+        }
 
-        $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-        $authstring = base64_encode($authtmp);
+        if ($this->demerit->sync_status == Demerit::STATUS_READY_TO_CREATE) {
+            // pre-mark as FAILED (your choice kept)
+            $this->demerit['sync_status'] = Demerit::STATUS_FAILED_CREATION;
+            $this->demerit->save();
 
-        if (!$stuID) {
-        } else {
-            if (!$pointCategory) {
-            } else {
-                $pointScale = ArborPointCategory::where('id', $internalReference->arbor_point_category_id)
-                    ->first()
-                    ->ArborPointScale()
-                    ->pluck('arbor_id')
-                    ->first();
+            $client = Http::baseUrl(config('services.arbor.base_url'))
+                ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
+                ->acceptJson()
+                ->asJson();
 
-                $correctDateTime = Carbon::parse(new DateTime($data['date']))->setTimezone('Europe/London')->toDateTimeString();
+            $behaviourAction1ID = null;
+            $behaviourAction2ID = null;
+            $behaviourID = null;
+            $pointID = null;
+            $matchedTeacher = true;
+            $matchedClass = true;
 
-                $restArray = [
-                    'request' => [
-                        'pointAward' => [
-                            'student' => [
-                                'entityType' => 'Student',
-                                'href' => '/rest-v2/students/' . $stuID
-                            ],
-                            'pointAwardScale' => [
-                                'entityType' => 'PointAwardScale',
-                                'href' => '/rest-v2/point-award-scales/' . $pointScale
-                            ],
-                            'pointAwardCategory' => [
-                                'entityType' => 'PointAwardCategory',
-                                'href' => '/rest-v2/point-award-categories/' . $pointCategory
-                            ],
-                            'event' => [
-                                'entityType' => 'Session',
-                                'href' => '/rest-v2/sessions/' . $eventID
-                            ],
-                            'awardedByStaff' => [
-                                'entityType' => 'Staff',
-                                'href' => '/rest-v2/staffs/' . $teacherID
-                            ],
-                            'points' => $data['points'],
-                            'awardedDatetime' => $correctDateTime
-                        ]
-                    ]
-                ];
-                if (!$eventID) {
-                    unset($restArray['request']['pointAward']['event']);
-                    $matchedClass = false;
-                }
-                if (!$teacherID) {
-                    unset($restArray['request']['pointAward']['awardedByStaff']);
-                    $matchedTeacher = false;
-                }
+            // Resolve refs
+            $stuID = Student::where('record_id', $this->demerit->student_id)->value('arbor_id');
 
-                $pointResponse = Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->post(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Point-Award',
-                    $restArray
-                );
+            $teacherEmail = Teacher::where('record_id', $this->demerit->teacher_id)->value('email');
+            $teacherEmail = $teacherEmail ? mb_strtolower($teacherEmail) : null;
+            $teacherID = $teacherEmail
+                ? ArborStaff::whereRaw('LOWER(email) = ?', [$teacherEmail])->value('arbor_id')
+                : null;
 
-                if ($pointResponse->successful()) {
-                    $pointData = $pointResponse->json();
-                    $pointID = str($pointData['pointAward']['href'])
-                        ->after('/rest-v2/point-awards/')
-                        ->toInteger();
-                    $this->demerit['arbor_point_id'] = $pointID;
-                } else {
-                    $statusCode = $pointResponse->status();
-                    $errorMessage = $pointResponse->body();
-                }
+            $internalReference = EpraiseDemeritCategory::where('epraise_name', $this->demerit->category)->firstOrFail();
+            $pointCategory     = ArborPointCategory::findOrFail($internalReference->arbor_point_category_id);
+
+            $className = Course::where('course_id', $this->demerit->class_id)->value('course_name');
+            $eventID   = ArborClass::where('name', $className)
+                ->where('start_date_time', '<=', Carbon::parse($this->demerit->date))
+                ->orderBy('start_date_time', 'desc')
+                ->value('arbor_id');
+
+            // Early guard: missing student
+            if (!$stuID) {
+                Log::warning('CreateDemerit: missing student Arbor ID; aborting', [
+                    'demerit_id' => $this->demerit->id,
+                    'student_record_id' => $this->demerit->student_id,
+                ]);
+
+                $this->demerit->forceFill([
+                    'sync_status'     => Demerit::STATUS_FAILED_CREATION,
+                    'synced_at'       => now(),
+                    'matched_teacher' => false,
+                    'matched_class'   => false,
+                ])->save();
+                return $writeCount;
             }
 
+            // --- Point award ---
+            $pointScale = $pointCategory->ArborPointScale()->value('arbor_id');
+            $correctDateTime = Carbon::parse(new DateTime($this->demerit->date))->toDateTimeString();
 
-            if ((is_null($internalReference->arbor_behaviour_category_id) || !$internalReference->arbor_behaviour_category_id)) {
+            $restArray = [
+                'request' => [
+                    'pointAward' => [
+                        'student' => [
+                            'entityType' => 'Student',
+                            'href'       => '/rest-v2/students/' . $stuID
+                        ],
+                        'pointAwardScale' => [
+                            'entityType' => 'PointAwardScale',
+                            'href'       => '/rest-v2/point-award-scales/' . $pointScale
+                        ],
+                        'pointAwardCategory' => [
+                            'entityType' => 'PointAwardCategory',
+                            'href'       => '/rest-v2/point-award-categories/' . $pointCategory->arbor_id
+                        ],
+                        'event' => [
+                            'entityType' => 'Session',
+                            'href'       => '/rest-v2/sessions/' . $eventID
+                        ],
+                        'awardedByStaff' => [
+                            'entityType' => 'Staff',
+                            'href'       => '/rest-v2/staffs/' . $teacherID
+                        ],
+                        'points'          => abs((int) $this->demerit->points),
+                        'awardedDatetime' => $correctDateTime
+                    ]
+                ]
+            ];
+
+            if (!$eventID) {
+                unset($restArray['request']['pointAward']['event']);
+                $matchedClass = false;
+            }
+            if (!$teacherID) {
+                unset($restArray['request']['pointAward']['awardedByStaff']);
+                $matchedTeacher = false;
+            }
+
+            $pointResponse = $client->post('/rest-v2/point-awards', $restArray);
+            $writeCount++;
+
+            if ($pointResponse->successful()) {
+                $pointData = $pointResponse->json();
+                $pointID = str($pointData['pointAward']['href'])
+                    ->after('/rest-v2/point-awards/')
+                    ->toInteger();
+                $this->demerit['arbor_point_id'] = $pointID;
             } else {
+                Log::warning('CreateDemerit: point-awards failed', [
+                    'demerit_id' => $this->demerit->id,
+                    'status'     => $pointResponse->status(),
+                    'body'       => $pointResponse->body(),
+                    'payload'    => $restArray,
+                ]);
+            }
+
+            // --- Behaviour (only if mapped) ---
+            if ($internalReference->arbor_behaviour_category_id) {
+                $behaviourCategory = ArborBehaviourCategory::findOrFail($internalReference->arbor_behaviour_category_id);
+
                 $behaviourArray = [
                     'request' => [
                         'behaviouralIncident' => [
                             'behaviour' => [
                                 'entityType' => 'Behaviour',
-                                'href' => '/rest-v2/behaviour/' . $behaviourCategory->arbor_id,
+                                'href'       => '/rest-v2/behaviours/' . $behaviourCategory->arbor_id,
                             ],
                             'loggedByStaff' => [
                                 'entityType' => 'Staff',
-                                'href' => '/rest-v2/staffs/' . $teacherID,
+                                'href'       => '/rest-v2/staffs/' . $teacherID,
                             ],
                             'event' => [
                                 'entityType' => 'Session',
-                                'href' => '/rest-v2/sessions/' . $eventID
+                                'href'       => '/rest-v2/sessions/' . $eventID
                             ],
-                            'narrative' => $data['comment'],
-                            'incidentDatetime' => Carbon::parse($data['date'])->setTimezone('Europe/London')->toDateTimeString(),
-                            'resolvedDatetime' => Carbon::parse($data['date'])->setTimezone('Europe/London')->toDateTimeString(),
-                            'severity' => $behaviourCategory->severity,
+                            'narrative'        => $this->demerit->comment,
+                            'incidentDatetime' => Carbon::parse($this->demerit->date)->toDateTimeString(),
+                            'resolvedDatetime' => Carbon::parse($this->demerit->date)->toDateTimeString(),
+                            'severity'         => $behaviourCategory->severity,
                         ]
                     ]
                 ];
-
 
                 if (!$eventID) {
                     unset($behaviourArray['request']['behaviouralIncident']['event']);
@@ -182,13 +187,8 @@ class CreateDemerit implements ShouldQueue
                     $matchedTeacher = false;
                 }
 
-                $behaviourResponse = Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->post(
-                    'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident',
-                    $behaviourArray
-                );
+                $behaviourResponse = $client->post('/rest-v2/behavioural-incidents', $behaviourArray);
+                $writeCount++;
 
                 if ($behaviourResponse->successful()) {
                     $behaviourData = $behaviourResponse->json();
@@ -197,39 +197,34 @@ class CreateDemerit implements ShouldQueue
                         ->toInteger();
                     $this->demerit['arbor_behaviour_id'] = $behaviourID;
 
+                    // Student involvement
                     $behaviourStuArray = [
                         'request' => [
                             'behaviouralIncidentStudentInvolvement' => [
                                 'behaviouralIncident' => [
                                     'entityType' => 'BehaviouralIncident',
-                                    'href' => '/rest-v2/behavioural-incident/' . $behaviourID
+                                    'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
                                 ],
                                 'student' => [
                                     'entityType' => 'Student',
-                                    'href' => '/rest-v2/students/' . $stuID
+                                    'href'       => '/rest-v2/students/' . $stuID
                                 ],
                                 'assignee' => [
                                     'entityType' => 'Staff',
-                                    'href' => '/rest-v2/staffs/' . $teacherID,
+                                    'href'       => '/rest-v2/staffs/' . $teacherID,
                                 ],
-                                'resolvedDatetime' => Carbon::parse($data['date'])->setTimezone('Europe/London')->toDateTimeString(),
-                                'severity' => $behaviourCategory->severity,
+                                'resolvedDatetime' => Carbon::parse($this->demerit->date)->toDateTimeString(),
+                                'severity'         => $behaviourCategory->severity,
                             ]
                         ]
                     ];
-
                     if (!$teacherID) {
                         unset($behaviourStuArray['request']['behaviouralIncidentStudentInvolvement']['assignee']);
                         $matchedTeacher = false;
                     }
 
-                    $behaviourStuResponse = Http::withHeaders([
-                        'Authorization' => 'Basic ' . $authstring,
-                        'Content-Type' => 'application/json',
-                    ])->post(
-                        'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Student-Involvement',
-                        $behaviourStuArray
-                    );
+                    $behaviourStuResponse = $client->post('/rest-v2/behavioural-incident-student-involvements', $behaviourStuArray);
+                    $writeCount++;
 
                     if ($behaviourStuResponse->successful()) {
                         $behaviourStuData = $behaviourStuResponse->json();
@@ -237,147 +232,140 @@ class CreateDemerit implements ShouldQueue
                             ->after('/rest-v2/behavioural-incident-student-involvements/')
                             ->toInteger();
 
-                        if (!$pointID) {
-                        } else {
-
+                        // Action linking to PointAward
+                        if ($pointID) {
                             $behaviourAction2Array = [
                                 'request' => [
                                     'behaviouralIncidentAction' => [
                                         'behaviouralIncident' => [
                                             'entityType' => 'BehaviouralIncident',
-                                            'href' => '/rest-v2/behavioural-incident/' . $behaviourID
+                                            'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
                                         ],
                                         'action' => [
                                             'entityType' => 'PointAward',
-                                            'href' => '/rest-v2/point-awards/' . $pointID,
+                                            'href'       => '/rest-v2/point-awards/' . $pointID,
                                         ],
                                         'student' => [
                                             'entityType' => 'Student',
-                                            'href' => '/rest-v2/students/' . $stuID
+                                            'href'       => '/rest-v2/students/' . $stuID
                                         ],
                                         'isAutomatic' => 'true',
                                     ]
                                 ]
                             ];
 
-                            $behaviourAction2Response = Http::withHeaders([
-                                'Authorization' => 'Basic ' . $authstring,
-                                'Content-Type' => 'application/json',
-                            ])->post(
-                                'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Action',
-                                $behaviourAction2Array
-                            );
+                            $behaviourAction2Response = $client->post('/rest-v2/behavioural-incident-actions', $behaviourAction2Array);
+                            $writeCount++;
 
                             if ($behaviourAction2Response->successful()) {
-                                $behaviourStuData = $behaviourStuResponse->json();
                                 $behaviourAction2Data = $behaviourAction2Response->json();
                                 $behaviourAction2ID = str($behaviourAction2Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                            } else {
+                                Log::warning('CreateDemerit: incident-action (PointAward) failed', [
+                                    'demerit_id' => $this->demerit->id,
+                                    'status'     => $behaviourAction2Response->status(),
+                                    'body'       => $behaviourAction2Response->body(),
+                                    'payload'    => $behaviourAction2Array,
+                                ]);
                             }
                         }
-                        if (!$teacherID) {
-                        } else {
 
+                        // Action linking to Staff
+                        if ($teacherID) {
                             $behaviourAction1Array = [
                                 'request' => [
                                     'behaviouralIncidentAction' => [
                                         'behaviouralIncident' => [
                                             'entityType' => 'BehaviouralIncident',
-                                            'href' => '/rest-v2/behavioural-incident/' . $behaviourID
+                                            'href'       => '/rest-v2/behavioural-incidents/' . $behaviourID
                                         ],
                                         'action' => [
                                             'entityType' => 'Staff',
-                                            'href' => '/rest-v2/staffs/' . $teacherID,
+                                            'href'       => '/rest-v2/staffs/' . $teacherID,
                                         ],
                                         'student' => [
                                             'entityType' => 'Student',
-                                            'href' => '/rest-v2/students/' . $stuID
+                                            'href'       => '/rest-v2/students/' . $stuID
                                         ],
                                         'isAutomatic' => 'true',
                                     ]
                                 ]
                             ];
 
-                            $behaviourAction1Response = Http::withHeaders([
-                                'Authorization' => 'Basic ' . $authstring,
-                                'Content-Type' => 'application/json',
-                            ])->post(
-                                'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident-Action',
-                                $behaviourAction1Array
-                            );
+                            $behaviourAction1Response = $client->post('/rest-v2/behavioural-incident-actions', $behaviourAction1Array);
+                            $writeCount++;
 
                             if ($behaviourAction1Response->successful()) {
-                                $behaviourStuData = $behaviourStuResponse->json();
                                 $behaviourAction1Data = $behaviourAction1Response->json();
                                 $behaviourAction1ID = str($behaviourAction1Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                            } else {
+                                Log::warning('CreateDemerit: incident-action (Staff) failed', [
+                                    'demerit_id' => $this->demerit->id,
+                                    'status'     => $behaviourAction1Response->status(),
+                                    'body'       => $behaviourAction1Response->body(),
+                                    'payload'    => $behaviourAction1Array,
+                                ]);
                             }
                         }
-                        $behaviourActionID = [
-                            'behaviourAction1' => $behaviourAction1ID ?? null,
-                            'behaviourAction2' => $behaviourAction2ID ?? null,
+
+                        $this->demerit['arbor_action_id'] = [
+                            'behaviourAction1' => $behaviourAction1ID,
+                            'behaviourAction2' => $behaviourAction2ID,
                         ];
-                        $this->demerit['arbor_action_id'] = $behaviourActionID;
                     } else {
                         $this->demerit['arbor_behaviour_id'] = null;
-                        $response = Http::withHeaders([
-                            'Authorization' => 'Basic ' . $authstring,
-                            'Content-Type' => 'application/json',
-                        ])->delete(
-                            'https://api-sandbox2.uk.arbor.sc/rest-v2/Behavioural-Incident/' . $behaviourID,
-                        );
+
+                        Log::warning('CreateDemerit: student involvement failed; deleting incident', [
+                            'demerit_id' => $this->demerit->id,
+                            'status'     => $behaviourStuResponse->status(),
+                            'body'       => $behaviourStuResponse->body(),
+                            'payload'    => $behaviourStuArray,
+                        ]);
+
+                        $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                        if (!$response->successful()) {
+                            Log::warning('CreateDemerit: delete behavioural-incident failed', [
+                                'demerit_id' => $this->demerit->id,
+                                'status'     => $response->status(),
+                                'body'       => $response->body(),
+                            ]);
+                        }
                         $behaviourID = null;
                     }
-
-
-
-
-
-                    $restArray5 = [
-                        'request' => [
-                            'userNotification' => [
-                                'user' => [
-                                    'entityType' => 'User',
-                                    'href' => '/rest-v2/user/5471'
-                                ],
-                                'isRead' => false,
-                                'action' => 'loadPage',
-                                'status' => 'NEW',
-                                'type' => 1,
-                                'description' => 'New Demerit for BOBOBOB',
-                                'subject' => 'LOOK HERE NOW',
-                                'icon' => 'warning_black',
-                                'parameters' => [
-                                    'url' => '/behavioural-incident-ui/overview/id/' . $behaviourID,
-                                ],
-
-                            ]
-                        ]
-                    ];
-
-                    $response5 = Http::withHeaders([
-                        'Authorization' => 'Basic ' . $authstring,
-                        'Content-Type' => 'application/json',
-                    ])->post(
-                        'https://api-sandbox2.uk.arbor.sc/rest-v2/User-Notification',
-                        $restArray5
-                    );
-
-                    $data = $response5->json();
+                } else {
+                    Log::warning('CreateDemerit: behavioural-incidents failed', [
+                        'demerit_id' => $this->demerit->id,
+                        'status'     => $behaviourResponse->status(),
+                        'body'       => $behaviourResponse->body(),
+                        'payload'    => $behaviourArray,
+                    ]);
                 }
             }
 
-            if (!$behaviourID && !$pointID) {
+            // --- Finalisation ---
+            if ($behaviourID || $pointID) {
+                $this->demerit->forceFill([
+                    'synced_at'       => now(),
+                    'sync_status'     => Demerit::STATUS_PROCESSED_SUCCESSFULLY,
+                    'matched_teacher' => $matchedTeacher,
+                    'matched_class'   => $matchedClass,
+                ])->save();
             } else {
+                $this->demerit->forceFill([
+                    'synced_at'   => now(),
+                    'sync_status' => Demerit::STATUS_FAILED_CREATION,
+                ])->save();
 
-                $this->demerit['synced_at'] = Carbon::parse(now())->toDateTimeString();
-                $this->demerit['sync_status'] = 1;
-                $this->demerit['matched_teacher'] = $matchedTeacher;
-                $this->demerit['matched_class'] = $matchedClass;
-                $this->demerit->save();
+                Log::warning('CreateDemerit: finished FAILED (no point or behaviour created)', [
+                    'demerit_id' => $this->demerit->id,
+                ]);
             }
         }
+
+        return $writeCount;
     }
 }

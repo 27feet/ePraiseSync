@@ -26,7 +26,7 @@ return new class extends Migration
             $table->string('arbor_id')->nullable();
             $table->boolean('matched_teacher')->default(false);
             $table->boolean('matched_class')->default(false);
-            $table->integer('sync_status')->default(0); // 0 = not synced, 1 = synced, -1 = delete
+            $table->integer('sync_status')->default(1);
         });
     }
 

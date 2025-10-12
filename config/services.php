@@ -35,4 +35,40 @@ return [
         ],
     ],
 
+    'arbor' => [
+        'base_url' => env('ARBOR_URL'),
+        'username' => env('ARBOR_APP_USERNAME'),
+        'password' => env('ARBOR_APP_PASSWORD'),
+    ],
+
+    'epraise' => [
+        'school_id' => env('EPRAISE_SCHOOL_ID'),
+        'api_key'   => env('EPRAISE_API_KEY'),
+        'endpoints' => [
+            'interventions' => env('EPRAISE_INTERVENTION_QUERY'),
+            'demerits'      => env('EPRAISE_DEMERIT_QUERY'),
+            'points'        => env('EPRAISE_POINT_QUERY'),
+            'classes'      => env('EPRAISE_CLASSES_QUERY'),
+            'teachers'        => env('EPRAISE_TEACHER_QUERY'),
+            'students'      => env('EPRAISE_STUDENT_QUERY'),
+        ],
+    ],
+
+    'behaviour_feeds' => [
+        'staff' => [
+            'url'      => env('BEHAVIOUR_FEED_STAFF_URL'),
+            'password' => env('BEHAVIOUR_FEED_STAFF_PASSWORD'),
+        ],
+        'tutors' => [
+            'url'      => env('BEHAVIOUR_FEED_TUTOR_HOY_URL'),
+            'password' => env('BEHAVIOUR_FEED_TUTOR_HOY_PASSWORD'),
+        ],
+        'parents' => [
+            'url'      => env('BEHAVIOUR_FEED_PARENTS_URL'),
+            'password' => env('BEHAVIOUR_FEED_PARENTS_PASSWORD'),
+        ],
+
+        'timeout' => (int) env('BEHAVIOUR_FEED_TIMEOUT', 30),
+    ],
+
 ];
