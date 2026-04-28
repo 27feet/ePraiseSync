@@ -21,6 +21,7 @@ use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseDemeritCategory;
 use App\Models\EpraiseInterventionCategory;
 use App\Support\EpraiseUrl;
+use App\Support\ArborRateLimiter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -53,6 +54,13 @@ query {
 GQL;
 
         while ($checkMore) {
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
+            ArborRateLimiter::consume();
             $response = ArborGraphQL::query($query);
 
             if (!method_exists($response, 'getData') || !is_array($response->getData())) {

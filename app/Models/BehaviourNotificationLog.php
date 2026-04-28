@@ -5,6 +5,8 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use App\Models\BehaviourRuleGroup;
+use App\Models\BehaviourRuleLevel;
 
 class BehaviourNotificationLog extends Model
 {
@@ -14,6 +16,8 @@ class BehaviourNotificationLog extends Model
 
     protected $fillable = [
         'rule_id',
+        'behaviour_rule_group_id',
+        'behaviour_rule_level_id',
         'student_id',
 
         // What was counted
@@ -22,6 +26,7 @@ class BehaviourNotificationLog extends Model
 
         // Threshold reached
         'hit_threshold',
+        'counter_cycle',
 
         // Window details
         'window_type',                   // 'term' | 'rolling_school_days' | 'today' (nullable)
@@ -37,8 +42,11 @@ class BehaviourNotificationLog extends Model
 
     protected $casts = [
         'rule_id'                     => 'integer',
+        'behaviour_rule_group_id'     => 'integer',
+        'behaviour_rule_level_id'     => 'integer',
         'student_id'                  => 'integer',
         'hit_threshold'               => 'integer',
+        'counter_cycle'               => 'integer',
         'window_term_id'              => 'integer',
         'window_school_days_lookback' => 'integer',
 
@@ -56,6 +64,16 @@ class BehaviourNotificationLog extends Model
     public function rule(): BelongsTo
     {
         return $this->belongsTo(BehaviourNotificationRule::class, 'rule_id');
+    }
+
+    public function ruleGroup(): BelongsTo
+    {
+        return $this->belongsTo(BehaviourRuleGroup::class, 'behaviour_rule_group_id');
+    }
+
+    public function ruleLevel(): BelongsTo
+    {
+        return $this->belongsTo(BehaviourRuleLevel::class, 'behaviour_rule_level_id');
     }
 
     public function student(): BelongsTo

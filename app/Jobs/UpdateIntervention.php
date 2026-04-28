@@ -12,7 +12,8 @@ use App\Models\Intervention;
 use App\Models\ArborPointCategory;
 use App\Models\EpraiseInterventionCategory;
 use App\Models\ArborBehaviourCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
+use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -22,10 +23,26 @@ class UpdateIntervention implements ShouldQueue
     use Queueable;
 
     protected Intervention $intervention;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $interventionID)
     {
         $this->intervention = Intervention::where('id', $interventionID)->firstOrFail();
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id'        => $this->intervention->student_id,
+            'teacher_id'        => $this->intervention->teacher_id,
+            'demerit_id'        => $this->intervention->demerit_id,
+            'subject'           => $this->intervention->subject,
+            'intervention_type' => $this->intervention->intervention_type,
+            'date_added'        => $this->intervention->date_added,
+            'comment'           => $this->intervention->comment,
+        ];
+        return Checksum::fromFields($fields);
     }
 
     public function handle(): int
@@ -41,10 +58,7 @@ class UpdateIntervention implements ShouldQueue
             'sync_status' => Intervention::STATUS_FAILED_UPDATE,
         ])->save();
 
-        $client = Http::baseUrl(config('services.arbor.base_url'))
-            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-            ->acceptJson()
-            ->asJson();
+        $client = ArborHttp::client();
 
         $matchedTeacher = true;
         $matchedClass   = true;
@@ -58,6 +72,7 @@ class UpdateIntervention implements ShouldQueue
             : null;
 
         if (!$stuID) {
+            $this->rememberError(null, 'Missing student Arbor ID');
             Log::warning('UpdateIntervention: missing student Arbor ID; aborting', [
                 'intervention_id'   => $this->intervention->id,
                 'student_record_id' => $this->intervention->student_id,
@@ -67,6 +82,9 @@ class UpdateIntervention implements ShouldQueue
                 'sync_status'     => Intervention::STATUS_FAILED_UPDATE,
                 'matched_teacher' => false,
                 'matched_class'   => false,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
             return $writeCount;
         }
@@ -86,11 +104,19 @@ class UpdateIntervention implements ShouldQueue
 
         if (!$hasPointMapping && !$hasBehaviourMapping) {
             // nothing to update remotely; count as successful no-op
+            $checksum = $this->computeChecksum();
             $this->intervention->forceFill([
                 'synced_at'       => now(),
                 'sync_status'     => Intervention::STATUS_PROCESSED_SUCCESSFULLY,
                 'matched_teacher' => $matchedTeacher,
                 'matched_class'   => $matchedClass,
+                'checksum'        => $checksum,
+                'synced_checksum' => $checksum,
+                'sync_attempts'   => 0,
+                'sync_last_failed_at' => null,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => null,
+                'sync_last_error_body' => null,
             ])->save();
             return $writeCount;
         }
@@ -109,7 +135,7 @@ class UpdateIntervention implements ShouldQueue
             : null;
 
         // ---------- POINT AWARD (if mapped) ----------
-        $pointID = null;
+        $pointID = $this->intervention->arbor_point_id;
         if ($hasPointMapping) {
             $pointScale = $pointCategory->ArborPointScale()->value('arbor_id');
             $points     = (int) ($this->intervention->points ?? $internal->default_points ?? 0);
@@ -163,6 +189,7 @@ class UpdateIntervention implements ShouldQueue
                     $pointID = str($pointJson['pointAward']['href'])->after('/rest-v2/point-awards/')->toInteger();
                     $this->intervention['arbor_point_id'] = $pointID;
                 } else {
+                    $this->rememberError($pointRes->status(), $pointRes->body());
                     Log::warning('UpdateIntervention: point-awards upsert failed', [
                         'intervention_id' => $this->intervention->id,
                         'status'          => $pointRes->status(),
@@ -177,6 +204,7 @@ class UpdateIntervention implements ShouldQueue
         if ($hasBehaviourMapping) {
             $behaviourCategory = ArborBehaviourCategory::find($internal->arbor_behaviour_category_id);
             if (!$behaviourCategory) {
+                $this->rememberError(null, 'Mapped intervention behaviour category not found locally');
                 Log::warning('UpdateIntervention: mapped behaviour category not found locally', [
                     'intervention_id' => $this->intervention->id,
                     'behaviour_cat'   => $internal->arbor_behaviour_category_id,
@@ -312,6 +340,7 @@ class UpdateIntervention implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($act2Res->status(), $act2Res->body());
                                 Log::warning('UpdateIntervention: behavioural-incident-action (PointAward) upsert failed', [
                                     'intervention_id' => $this->intervention->id,
                                     'status'          => $act2Res->status(),
@@ -352,6 +381,7 @@ class UpdateIntervention implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($act1Res->status(), $act1Res->body());
                                 Log::warning('UpdateIntervention: behavioural-incident-action (Staff) upsert failed', [
                                     'intervention_id' => $this->intervention->id,
                                     'status'          => $act1Res->status(),
@@ -366,6 +396,7 @@ class UpdateIntervention implements ShouldQueue
                         ];
                     } else {
                         $this->intervention['arbor_behaviour_id'] = null;
+                        $this->rememberError($involRes->status(), $involRes->body());
 
                         Log::warning('UpdateIntervention: behavioural-incident-student-involvement upsert failed', [
                             'intervention_id' => $this->intervention->id,
@@ -376,6 +407,7 @@ class UpdateIntervention implements ShouldQueue
                         $cleanup = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
                         $writeCount++;
                         if (!$cleanup->successful() && !in_array($cleanup->status(), [404, 410], true)) {
+                            $this->rememberError($cleanup->status(), $cleanup->body());
                             Log::warning('UpdateIntervention: cleanup delete behavioural-incident failed', [
                                 'intervention_id' => $this->intervention->id,
                                 'behaviour_id'    => $behaviourID,
@@ -386,6 +418,7 @@ class UpdateIntervention implements ShouldQueue
                         $behaviourID = null;
                     }
                 } else {
+                    $this->rememberError($behRes->status(), $behRes->body());
                     Log::warning('UpdateIntervention: behavioural-incidents upsert failed', [
                         'intervention_id' => $this->intervention->id,
                         'status'          => $behRes->status(),
@@ -396,20 +429,42 @@ class UpdateIntervention implements ShouldQueue
         }
 
         // Finalize
-        if ($behaviourID || $pointID || (!$hasPointMapping && !$hasBehaviourMapping)) {
+        $pointCreated = !$hasPointMapping || !empty($this->intervention->arbor_point_id);
+        $behaviourCreated = !$hasBehaviourMapping
+            || (!empty($this->intervention->arbor_behaviour_id) && !empty($this->intervention->arbor_behaviour_student_id));
+
+        if ($pointCreated && $behaviourCreated) {
+            $checksum = $this->computeChecksum();
             $this->intervention->forceFill([
                 'synced_at'       => now(),
                 'sync_status'     => Intervention::STATUS_PROCESSED_SUCCESSFULLY,
                 'matched_teacher' => $matchedTeacher,
                 'matched_class'   => $matchedClass,
+                'checksum'        => $checksum,
+                'synced_checksum' => $checksum,
+                'sync_attempts'   => 0,
+                'sync_last_failed_at' => null,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => null,
+                'sync_last_error_body' => null,
             ])->save();
         } else {
+            $this->rememberError($this->lastErrorStatus, $this->lastErrorBody ?? 'Update intervention failed');
             $this->intervention->forceFill([
                 'synced_at'   => now(),
                 'sync_status' => Intervention::STATUS_FAILED_UPDATE,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
         }
 
         return $writeCount;
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

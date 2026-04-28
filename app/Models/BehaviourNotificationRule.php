@@ -78,6 +78,18 @@ class BehaviourNotificationRule extends Model
         return $this->category ? [$this->category] : [];
     }
 
+    /**
+     * Canonicalise categories to an array and keep legacy category in sync.
+     */
+    public function setCategoriesAttribute($value): void
+    {
+        $cats = is_array($value) ? array_values(array_filter($value, fn($v) => $v !== null && $v !== '')) : [];
+        $this->attributes['categories'] = $cats ? json_encode($cats) : null;
+        if (!empty($cats)) {
+            $this->attributes['category'] = $cats[0];
+        }
+    }
+
     public function scopeRealtimeToday(Builder $q): Builder
     {
         return $q->where('mode', 'realtime_today');

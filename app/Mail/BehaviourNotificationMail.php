@@ -58,7 +58,7 @@ class BehaviourNotificationMail extends Mailable
     {
         $map = [];
         foreach ($vars as $k => $v) {
-            $map['{{ ' . $k . ' }}'] = (string) $v;
+            $map['{{ ' . $k . ' }}'] = is_array($v) ? json_encode($v) : (string) $v;
         }
         return strtr($str, $map);
     }

@@ -14,7 +14,8 @@ class BehaviourSendTodayCommand extends Command
 {
     protected $signature = 'behaviour:send-today
                             {--date= : ISO date (YYYY-MM-DD). Defaults to today}
-                            {--dry-run : Show what would be sent without sending}';
+                            {--dry-run : Show what would be sent without sending}
+                            {--test-to= : Send all emails to this address instead of real recipients}';
 
     protected $description = 'Send behaviour notification emails for logs created on the given date (default: today).';
 
@@ -25,15 +26,29 @@ class BehaviourSendTodayCommand extends Command
         $start   = $asOf->copy()->startOfDay();
         $end     = $asOf->copy()->endOfDay();
         $dryRun  = (bool) $this->option('dry-run');
+        $testTo  = $this->option('test-to') ? trim((string) $this->option('test-to')) : null;
+
+        if ($testTo && !filter_var($testTo, FILTER_VALIDATE_EMAIL)) {
+            $this->error("Invalid --test-to email: {$testTo}");
+            return self::FAILURE;
+        }
 
         /** @var BehaviourRecipientResolver $resolver */
         $resolver = app(BehaviourRecipientResolver::class);
+        $legacyEnabled = (bool) config('behaviour_notifications.enable_legacy_rules', false);
 
-        $logs = BehaviourNotificationLog::query()
-            ->with('rule')
+        $logsQuery = BehaviourNotificationLog::query()
+            ->with(['rule', 'ruleGroup', 'ruleLevel'])
             ->whereBetween('created_at', [$start, $end])
-            ->orderBy('id')
-            ->get();
+            ->orderBy('id');
+
+        if (!$legacyEnabled) {
+            $logsQuery
+                ->whereNotNull('behaviour_rule_group_id')
+                ->whereNotNull('behaviour_rule_level_id');
+        }
+
+        $logs = $logsQuery->get();
 
         if ($logs->isEmpty()) {
             $this->info("No behaviour_notification_logs created between {$start} and {$end}.");
@@ -46,7 +61,16 @@ class BehaviourSendTodayCommand extends Command
         $sentParents = 0;
 
         foreach ($logs as $log) {
-            if (!$log->rule) {
+            $isGroupLog = (bool) $log->behaviour_rule_level_id;
+            if (!$legacyEnabled && !$isGroupLog) {
+                continue;
+            }
+            if ($isGroupLog) {
+                if (!$log->ruleLevel || !$log->ruleGroup) {
+                    $this->warn("Log #{$log->id}: missing group/level relation; skipping.");
+                    continue;
+                }
+            } elseif (!$log->rule) {
                 $this->warn("Log #{$log->id}: missing rule relation; skipping.");
                 continue;
             }
@@ -72,42 +96,75 @@ class BehaviourSendTodayCommand extends Command
             $studentArborId  = (string) ($student->arbor_id ?? '');
             $studentName     = $student->name ?: ($studentArborId ?: $studentRecordId);
 
-            // Resolve recipients for this student + rule (expects record_id)
-            $recips = $resolver->resolveForRule($studentRecordId, $log->rule);
+            if ($isGroupLog) {
+                $recips = $resolver->resolveForGroupLevel($studentRecordId, $log->ruleGroup, $log->ruleLevel);
+                $templateKey = (string) $log->ruleLevel->template_key;
+                $recipientStaff = (bool) $log->ruleLevel->recipient_staff;
+                $recipientParents = (bool) $log->ruleLevel->recipient_parents;
+                $threshold = (int) $log->ruleLevel->threshold;
+            } else {
+                $recips = $resolver->resolveForRule($studentRecordId, $log->rule);
+                $templateKey = (string) $log->rule->template_key;
+                $recipientStaff = (bool) $log->rule->recipient_staff;
+                $recipientParents = (bool) $log->rule->recipient_parents;
+                $threshold = (int) $log->rule->threshold;
+            }
+
             $staffEmails   = $recips['staff']   ?? [];
             $parentTargets = $recips['parents'] ?? [];
 
             // Build a shared context for templating
             $snap = is_array($log->source_snapshot) ? $log->source_snapshot : [];
+            $rawCategory = $snap['category'] ?? null;
+            if ($rawCategory === null && is_string($log->category)) {
+                $decoded = json_decode($log->category, true);
+                $rawCategory = json_last_error() === JSON_ERROR_NONE ? $decoded : $log->category;
+            }
+            $categoryLabel = is_array($rawCategory)
+                ? implode(', ', $rawCategory)
+                : (string) ($rawCategory ?? '');
+            $rawValue = $snap['raw_value'] ?? ($snap['counter']['raw_value'] ?? ($snap['value'] ?? ($snap['count'] ?? '')));
+            $cycleValue = $snap['cycle_value'] ?? ($snap['counter']['effective_value'] ?? ($snap['value'] ?? ($snap['count'] ?? '')));
+            $cycleIndex = $snap['counter_cycle'] ?? ($snap['counter']['cycle'] ?? null);
+            $rolloverEvery = $snap['rollover_every'] ?? ($snap['counter']['rollover_every'] ?? null);
+            $counterMode = $snap['counter_mode'] ?? ($snap['counter']['mode'] ?? 'cumulative');
             $contextBase = [
                 'student_name' => $studentName,
-                'category'     => $snap['category'] ?? ($log->rule->category ?? ''),
-                'count'        => $snap['value']    ?? '',
-                'threshold'    => $log->rule->threshold ?? '',
+                'category'     => $categoryLabel,
+                'categories'   => is_array($rawCategory) ? $rawCategory : ($rawCategory ? [$rawCategory] : []),
+                'count'        => $cycleValue,
+                'value'        => $cycleValue,
+                'raw_value'    => $rawValue,
+                'cycle_value'  => $cycleValue,
+                'cycle_index'  => $cycleIndex,
+                'rollover_every' => $rolloverEvery,
+                'counter_mode' => $counterMode,
+                'threshold'    => $threshold,
                 'window_start' => optional($log->window_start_date)->toDateString(),
                 'window_end'   => optional($log->window_end_date)->toDateString(),
                 'as_of'        => optional($log->created_at)->toDateTimeString(),
             ];
 
             // 1) Staff — single email to all staff recipients (if any)
-            if (!empty($staffEmails) && $log->rule->recipient_staff) {
+            if (!empty($staffEmails) && $recipientStaff) {
                 $context = array_merge($contextBase, [
                     'staff_or_parent' => 'colleague',
                 ]);
 
                 if ($dryRun) {
                     $this->line(" • [STAFF] Log #{$log->id} → " . implode(', ', $staffEmails)
-                        . " | template={$log->rule->template_key} | student={$studentName}");
+                        . " | template={$templateKey} | student={$studentName}"
+                        . ($testTo ? " | test_to={$testTo}" : ''));
                 } else {
-                    Mail::to($staffEmails)->send(
-                        new BehaviourNotificationMail($context, (string) $log->rule->template_key)
+                    Mail::to($testTo ?: $staffEmails)->send(
+                        new BehaviourNotificationMail($context, $templateKey)
                     );
                     $sentStaff++;
                 }
             }
 
             // 2) Parents — one email per parent recipient (if any)
-            if (!empty($parentTargets) && $log->rule->recipient_parents) {
+            if (!empty($parentTargets) && $recipientParents) {
                 foreach ($parentTargets as $p) {
                     $email   = $p['email']   ?? null;
                     $title   = $p['title']   ?? null;
@@ -124,10 +181,11 @@ class BehaviourSendTodayCommand extends Command
 
                     if ($dryRun) {
                         $this->line(" • [PARENT] Log #{$log->id} → {$email}"
-                            . " | template={$log->rule->template_key} | student={$studentName}");
+                            . " | template={$templateKey} | student={$studentName}"
+                            . ($testTo ? " | test_to={$testTo}" : ''));
                     } else {
-                        Mail::to($email)->send(
-                            new BehaviourNotificationMail($context, (string) $log->rule->template_key)
+                        Mail::to($testTo ?: $email)->send(
+                            new BehaviourNotificationMail($context, $templateKey)
                         );
                         $sentParents++;
                     }
@@ -135,7 +193,7 @@ class BehaviourSendTodayCommand extends Command
             }
 
             // Optional: store who we sent to
-            if (!$dryRun) {
+            if (!$dryRun && !$testTo) {
                 $existing = is_array($log->recipients_snapshot) ? $log->recipients_snapshot : [];
                 $merged = array_merge($existing, [
                     'staff'   => $staffEmails,

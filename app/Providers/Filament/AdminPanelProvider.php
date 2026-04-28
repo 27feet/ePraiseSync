@@ -25,7 +25,8 @@ class AdminPanelProvider extends PanelProvider
         return $panel
             ->default()
             ->id('admin')
-            ->path('admin')
+            // Move panel to site root (no /admin prefix)
+            ->path('')
             ->login()
             ->colors([
                 'primary' => Color::Amber,

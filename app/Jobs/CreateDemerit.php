@@ -11,7 +11,8 @@ use App\Models\Teacher;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
+use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseDemeritCategory;
@@ -25,6 +26,8 @@ class CreateDemerit implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Demerit $demerit;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $demeritID)
     {
@@ -35,9 +38,22 @@ class CreateDemerit implements ShouldQueue
     {
         $writeCount = 0;
 
-        // Idempotency
-        if ($this->demerit->arbor_point_id || $this->demerit->arbor_behaviour_id) {
-            return 0; // already synced
+        // Idempotency: if partially created remotely, continue via update flow.
+        $hasRemote = $this->demerit->arbor_point_id
+            || $this->demerit->arbor_behaviour_id
+            || $this->demerit->arbor_behaviour_student_id;
+        $actions = $this->demerit->arbor_action_id;
+        if (is_string($actions)) {
+            $actions = json_decode($actions, true);
+        }
+        if (is_array($actions) && !empty(array_filter(array_values($actions)))) {
+            $hasRemote = true;
+        }
+        if ($hasRemote) {
+            $this->demerit->forceFill([
+                'sync_status' => Demerit::STATUS_REQUIRES_UPDATE,
+            ])->save();
+            return 0;
         }
 
         if ($this->demerit->sync_status == Demerit::STATUS_READY_TO_CREATE) {
@@ -45,10 +61,7 @@ class CreateDemerit implements ShouldQueue
             $this->demerit['sync_status'] = Demerit::STATUS_FAILED_CREATION;
             $this->demerit->save();
 
-            $client = Http::baseUrl(config('services.arbor.base_url'))
-                ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-                ->acceptJson()
-                ->asJson();
+            $client = ArborHttp::client();
 
             $behaviourAction1ID = null;
             $behaviourAction2ID = null;
@@ -77,6 +90,7 @@ class CreateDemerit implements ShouldQueue
 
             // Early guard: missing student
             if (!$stuID) {
+                $this->rememberError(null, 'Missing student Arbor ID');
                 Log::warning('CreateDemerit: missing student Arbor ID; aborting', [
                     'demerit_id' => $this->demerit->id,
                     'student_record_id' => $this->demerit->student_id,
@@ -87,6 +101,9 @@ class CreateDemerit implements ShouldQueue
                     'synced_at'       => now(),
                     'matched_teacher' => false,
                     'matched_class'   => false,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
                 return $writeCount;
             }
@@ -143,6 +160,7 @@ class CreateDemerit implements ShouldQueue
                     ->toInteger();
                 $this->demerit['arbor_point_id'] = $pointID;
             } else {
+                $this->rememberError($pointResponse->status(), $pointResponse->body());
                 Log::warning('CreateDemerit: point-awards failed', [
                     'demerit_id' => $this->demerit->id,
                     'status'     => $pointResponse->status(),
@@ -263,6 +281,7 @@ class CreateDemerit implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                                 Log::warning('CreateDemerit: incident-action (PointAward) failed', [
                                     'demerit_id' => $this->demerit->id,
                                     'status'     => $behaviourAction2Response->status(),
@@ -303,6 +322,7 @@ class CreateDemerit implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                                 Log::warning('CreateDemerit: incident-action (Staff) failed', [
                                     'demerit_id' => $this->demerit->id,
                                     'status'     => $behaviourAction1Response->status(),
@@ -318,6 +338,7 @@ class CreateDemerit implements ShouldQueue
                         ];
                     } else {
                         $this->demerit['arbor_behaviour_id'] = null;
+                        $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                         Log::warning('CreateDemerit: student involvement failed; deleting incident', [
                             'demerit_id' => $this->demerit->id,
@@ -328,6 +349,7 @@ class CreateDemerit implements ShouldQueue
 
                         $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
                         if (!$response->successful()) {
+                            $this->rememberError($response->status(), $response->body());
                             Log::warning('CreateDemerit: delete behavioural-incident failed', [
                                 'demerit_id' => $this->demerit->id,
                                 'status'     => $response->status(),
@@ -337,6 +359,7 @@ class CreateDemerit implements ShouldQueue
                         $behaviourID = null;
                     }
                 } else {
+                    $this->rememberError($behaviourResponse->status(), $behaviourResponse->body());
                     Log::warning('CreateDemerit: behavioural-incidents failed', [
                         'demerit_id' => $this->demerit->id,
                         'status'     => $behaviourResponse->status(),
@@ -346,18 +369,43 @@ class CreateDemerit implements ShouldQueue
                 }
             }
 
+            $pointCreated = !empty($this->demerit->arbor_point_id);
+            $behaviourRequired = !empty($internalReference->arbor_behaviour_category_id);
+            $behaviourCreated = !$behaviourRequired
+                || (!empty($this->demerit->arbor_behaviour_id) && !empty($this->demerit->arbor_behaviour_student_id));
+
             // --- Finalisation ---
-            if ($behaviourID || $pointID) {
+            if ($pointCreated && $behaviourCreated) {
+                $checksum = $this->computeChecksum();
                 $this->demerit->forceFill([
                     'synced_at'       => now(),
                     'sync_status'     => Demerit::STATUS_PROCESSED_SUCCESSFULLY,
                     'matched_teacher' => $matchedTeacher,
                     'matched_class'   => $matchedClass,
+                    'checksum'        => $checksum,
+                    'synced_checksum' => $checksum,
+                    'sync_attempts'   => 0,
+                    'sync_last_failed_at' => null,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => null,
+                    'sync_last_error_body' => null,
+                ])->save();
+            } elseif ($this->hasAnyRemote()) {
+                $this->demerit->forceFill([
+                    'synced_at'       => null,
+                    'sync_status'     => Demerit::STATUS_REQUIRES_UPDATE,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
             } else {
+                $this->rememberError($this->lastErrorStatus, $this->lastErrorBody ?? 'Create demerit failed without remote IDs');
                 $this->demerit->forceFill([
                     'synced_at'   => now(),
                     'sync_status' => Demerit::STATUS_FAILED_CREATION,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
 
                 Log::warning('CreateDemerit: finished FAILED (no point or behaviour created)', [
@@ -367,5 +415,41 @@ class CreateDemerit implements ShouldQueue
         }
 
         return $writeCount;
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id' => $this->demerit->student_id,
+            'teacher_id' => $this->demerit->teacher_id,
+            'class_id'   => $this->demerit->class_id,
+            'subject'    => $this->demerit->subject,
+            'category'   => $this->demerit->category,
+            'reason'     => $this->demerit->reason,
+            'date'       => $this->demerit->date,
+            'points'     => $this->demerit->points,
+            'comment'    => $this->demerit->comment,
+        ];
+        return Checksum::fromFields($fields);
+    }
+
+    private function hasAnyRemote(): bool
+    {
+        if ($this->demerit->arbor_point_id || $this->demerit->arbor_behaviour_id || $this->demerit->arbor_behaviour_student_id) {
+            return true;
+        }
+
+        $actions = $this->demerit->arbor_action_id;
+        if (is_string($actions)) {
+            $actions = json_decode($actions, true);
+        }
+
+        return is_array($actions) && !empty(array_filter(array_values($actions)));
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

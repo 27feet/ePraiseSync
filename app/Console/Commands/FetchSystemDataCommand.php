@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 
 use App\Services\FetchBackgroundDataService;
 use Illuminate\Console\Command;
+use App\Support\TaskMonitor;
 
 class FetchSystemDataCommand extends Command
 {
@@ -19,6 +20,13 @@ class FetchSystemDataCommand extends Command
 
     public function handle()
     {
+        if (TaskMonitor::disabled('writeback:fetchSystemData')) {
+            $this->info('writeback:fetchSystemData is disabled via TaskMonitor.');
+            return 0;
+        }
+
+        TaskMonitor::heartbeat('writeback:fetchSystemData', 'running');
+
         $fetchService01 = new FetchBackgroundDataService();
         $fetchService02 = new FetchBackgroundDataService();
         $fetchService03 = new FetchBackgroundDataService();
@@ -38,12 +46,14 @@ class FetchSystemDataCommand extends Command
         $fetchService04->fetchArborClasses(request(), now()->subDays(10)->toDateString(), now()->addDays(10)->toDateString());
         $fetchService05->fetchArborPointScales(request());
         $fetchService06->fetchArborStaff(request());
-        // $fetchService07->fetchArborStudents(request());
+        //$fetchService07->fetchArborStudents(request());
         $fetchService08->fetchEpraiseClasses(request());
         $fetchService09->fetchEpraiseStudents(request());
         $fetchService10->fetchEpraiseTeachers(request());
         $fetchService11->updateDemeritCategories(request());
         $fetchService12->updateInterventionCategories(request());
         $fetchService13->updatePointCategories(request());
+
+        TaskMonitor::heartbeat('writeback:fetchSystemData', 'ok');
     }
 }

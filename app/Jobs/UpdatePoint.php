@@ -11,7 +11,8 @@ use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
 use App\Models\EpraisePointCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
+use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -21,10 +22,26 @@ class UpdatePoint implements ShouldQueue
     use Queueable;
 
     protected Point $point;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $pointID)
     {
         $this->point = Point::where('id', $pointID)->firstOrFail();
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id' => $this->point->student_id,
+            'teacher_id' => $this->point->teacher_id,
+            'class_id'   => $this->point->class_id,
+            'subject'    => $this->point->subject,
+            'category'   => $this->point->category,
+            'date'       => $this->point->date,
+            'points'     => $this->point->points,
+        ];
+        return Checksum::fromFields($fields);
     }
 
     public function handle(): int
@@ -38,12 +55,16 @@ class UpdatePoint implements ShouldQueue
 
         // Must have a remote ID to update
         if (!$this->point->arbor_id) {
+            $this->rememberError(null, 'Missing Arbor point id for update');
             Log::warning('UpdatePoint: missing remote arbor_id; cannot update', [
                 'point_id' => $this->point->id,
             ]);
             $this->point->forceFill([
                 'synced_at'   => now(),
                 'sync_status' => Point::STATUS_FAILED_UPDATE,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
             return 0;
         }
@@ -53,10 +74,7 @@ class UpdatePoint implements ShouldQueue
             'sync_status' => Point::STATUS_FAILED_UPDATE,
         ])->save();
 
-        $client = Http::baseUrl(config('services.arbor.base_url'))
-            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-            ->acceptJson()
-            ->asJson();
+        $client = ArborHttp::client();
 
         $matchedTeacher = true;
         $matchedClass   = true;
@@ -77,6 +95,7 @@ class UpdatePoint implements ShouldQueue
 
         // Early guard: missing student
         if (!$stuID) {
+            $this->rememberError(null, 'Missing student Arbor ID');
             Log::warning('UpdatePoint: missing student Arbor ID; aborting', [
                 'point_id'          => $this->point->id,
                 'student_record_id' => $this->point->student_id,
@@ -86,6 +105,9 @@ class UpdatePoint implements ShouldQueue
                 'sync_status'     => Point::STATUS_FAILED_UPDATE,
                 'matched_teacher' => false,
                 'matched_class'   => false,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
             return $writeCount;
         }
@@ -144,13 +166,22 @@ class UpdatePoint implements ShouldQueue
         $writeCount++;
 
         if ($response->successful()) {
+            $checksum = $this->computeChecksum();
             $this->point->forceFill([
                 'synced_at'       => now(),
                 'sync_status'     => Point::STATUS_PROCESSED_SUCCESSFULLY,
                 'matched_teacher' => $matchedTeacher,
                 'matched_class'   => $matchedClass,
+                'checksum'        => $checksum,
+                'synced_checksum' => $checksum,
+                'sync_attempts'   => 0,
+                'sync_last_failed_at' => null,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => null,
+                'sync_last_error_body' => null,
             ])->save();
         } else {
+            $this->rememberError($response->status(), $response->body());
             Log::warning('UpdatePoint: point-awards update failed', [
                 'point_id' => $this->point->id,
                 'arbor_id' => $this->point->arbor_id,
@@ -161,9 +192,18 @@ class UpdatePoint implements ShouldQueue
             $this->point->forceFill([
                 'synced_at'   => now(),
                 'sync_status' => Point::STATUS_FAILED_UPDATE,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
         }
 
         return $writeCount;
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

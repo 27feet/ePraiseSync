@@ -39,6 +39,14 @@ return [
         'base_url' => env('ARBOR_URL'),
         'username' => env('ARBOR_APP_USERNAME'),
         'password' => env('ARBOR_APP_PASSWORD'),
+        'sync' => [
+            'max_attempts' => (int) env('ARBOR_SYNC_MAX_ATTEMPTS', 10),
+            'retry_delays_seconds' => array_map(
+                static fn ($v) => (int) trim($v),
+                explode(',', (string) env('ARBOR_SYNC_RETRY_DELAYS', '60,180,600,1800,3600,7200,14400,21600,28800,43200'))
+            ),
+            'retry_jitter_percent' => (float) env('ARBOR_SYNC_RETRY_JITTER_PERCENT', 0.15),
+        ],
     ],
 
     'epraise' => [

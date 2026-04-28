@@ -15,7 +15,9 @@ class BehaviourEvaluateCommand extends Command
      *  php artisan behaviour:evaluate
      *  php artisan behaviour:evaluate --date=2025-09-06
      */
-    protected $signature = 'behaviour:evaluate {--date= : YYYY-MM-DD to evaluate (defaults to yesterday)}';
+    protected $signature = 'behaviour:evaluate
+                            {--date= : YYYY-MM-DD to evaluate (defaults to yesterday)}
+                            {--dry-run : Evaluate without creating notification logs}';
 
     protected $description = 'Evaluate behaviour notification rules and create logs for newly-triggered thresholds.';
 
@@ -26,12 +28,17 @@ class BehaviourEvaluateCommand extends Command
         $asOf = $dateOpt
             ? Carbon::parse($dateOpt)->startOfDay()
             : Carbon::yesterday()->startOfDay();
+        $dryRun = (bool) $this->option('dry-run');
 
-        $this->info("Evaluating rules as of {$asOf->toDateString()} …");
+        $this->info("Evaluating rules as of {$asOf->toDateString()}" . ($dryRun ? ' (dry-run)' : '') . " …");
 
-        $created = $evaluator->evaluateAndLog($asOf);
+        $created = $evaluator->evaluateAndLog($asOf, !$dryRun);
 
-        $this->info("Done. Created {$created} notification log(s).");
+        if ($dryRun) {
+            $this->info("Dry run complete. Would create {$created} notification log(s).");
+        } else {
+            $this->info("Done. Created {$created} notification log(s).");
+        }
 
         return self::SUCCESS;
     }

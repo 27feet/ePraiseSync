@@ -41,6 +41,16 @@ class Demerit extends Model
         'comment',
         'matched_teacher',
         'matched_class',
+        'last_seen_at',
+        'last_seen_run',
+        'missing_runs',
+        'sync_attempts',
+        'sync_last_failed_at',
+        'sync_next_retry_at',
+        'sync_last_error_status',
+        'sync_last_error_body',
+        'checksum',
+        'synced_checksum',
     ];
 
     protected $casts = [
@@ -65,6 +75,16 @@ class Demerit extends Model
         'comment' => 'string',
         'matched_teacher' => 'boolean',
         'matched_class' => 'boolean',
+        'last_seen_at' => 'datetime',
+        'last_seen_run' => 'string',
+        'missing_runs' => 'integer',
+        'sync_attempts' => 'integer',
+        'sync_last_failed_at' => 'datetime',
+        'sync_next_retry_at' => 'datetime',
+        'sync_last_error_status' => 'integer',
+        'sync_last_error_body' => 'string',
+        'checksum' => 'string',
+        'synced_checksum' => 'string',
     ];
 
     public $timestamps = true;

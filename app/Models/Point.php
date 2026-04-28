@@ -33,10 +33,19 @@ class Point extends Model
         'points',
         'arbor_id',
         'checksum',
+        'synced_checksum',
         'matched_teacher',
         'matched_class',
         'sync_status',
         'synced_at',
+        'last_seen_at',
+        'last_seen_run',
+        'missing_runs',
+        'sync_attempts',
+        'sync_last_failed_at',
+        'sync_next_retry_at',
+        'sync_last_error_status',
+        'sync_last_error_body',
     ];
 
     protected $casts = [
@@ -50,12 +59,21 @@ class Point extends Model
         'class_id' => 'integer',
         'arbor_id' => 'string',
         'checksum' => 'string',
+        'synced_checksum' => 'string',
         'subject' => 'string',
         'category' => 'string',
         'matched_teacher' => 'boolean',
         'matched_class' => 'boolean',
         'sync_status' => 'integer',
         'synced_at' => 'datetime',
+        'last_seen_at' => 'datetime',
+        'last_seen_run' => 'string',
+        'missing_runs' => 'integer',
+        'sync_attempts' => 'integer',
+        'sync_last_failed_at' => 'datetime',
+        'sync_next_retry_at' => 'datetime',
+        'sync_last_error_status' => 'integer',
+        'sync_last_error_body' => 'string',
     ];
 
     public $timestamps = true;

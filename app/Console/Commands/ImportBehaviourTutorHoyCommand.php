@@ -48,6 +48,7 @@ class ImportBehaviourTutorHoyCommand extends Command
         $dryRun = (bool) $this->option('dry-run');
         $written = 0;
         $skipped = 0;
+        $skippedMissingRecordId = 0;
 
         foreach ($rows as $row) {
             if (!is_array($row)) {
@@ -59,11 +60,18 @@ class ImportBehaviourTutorHoyCommand extends Command
             $studentRecordId = $row['student_record_id'] ?? $row['student_id'] ?? $row['student'] ?? null;
             $studentArborId  = $row['student_arbor_id']  ?? $row['upn']        ?? $row['arbor_id'] ?? null;
 
+            $studentRecordId = $this->normalizeId($studentRecordId);
+            $studentArborId = $this->normalizeId($studentArborId);
+
             // If we only have one ID, try to resolve the other from local Student
             if (!$studentRecordId && $studentArborId) {
-                $studentRecordId = Student::where('arbor_id', $studentArborId)->value('record_id');
+                $studentRecordId = $this->normalizeId(
+                    Student::where('arbor_id', $studentArborId)->value('record_id')
+                );
             } elseif (!$studentArborId && $studentRecordId) {
-                $studentArborId = Student::where('record_id', $studentRecordId)->value('arbor_id');
+                $studentArborId = $this->normalizeId(
+                    Student::where('record_id', $studentRecordId)->value('arbor_id')
+                );
             }
 
             if (!$studentRecordId && !$studentArborId) {
@@ -72,25 +80,37 @@ class ImportBehaviourTutorHoyCommand extends Command
                 continue;
             }
 
+            // Routing schema requires student_record_id (non-null unique key).
+            // If we cannot resolve it, skip this row rather than crashing the import.
+            if (!$studentRecordId) {
+                $skipped++;
+                $skippedMissingRecordId++;
+                if ($skippedMissingRecordId <= 5) {
+                    $this->warn('Skipping tutors/HOY row with unresolved student_record_id (student_arbor_id=' . ($studentArborId ?? 'null') . ').');
+                }
+                continue;
+            }
+
             // Pull a display name from the feed if available
             $first = $row['forename'] ?? $row['first_name'] ?? null;
             $last  = $row['surname']  ?? $row['last_name']  ?? null;
+            $yearGroup = trim($row['year_group'] ?? $row['YG'] ?? null);
             $displayName = trim(trim((string)$first) . ' ' . trim((string)$last));
 
             // If we have a name and we know the student, persist it to the Students table
             if (!$dryRun && $displayName) {
                 if ($studentRecordId) {
                     \App\Models\Student::where('record_id', $studentRecordId)
-                        ->where(function ($q) use ($displayName) {
-                            $q->whereNull('name')->orWhere('name', '!=', $displayName);
+                        ->where(function ($q) use ($displayName, $yearGroup) {
+                            $q->whereNull('name')->orWhere('name', '!=', $displayName)->orWhere('year_group', '!=', $yearGroup)->orWhereNull('year_group');
                         })
-                        ->update(['name' => $displayName]);
+                        ->update(['name' => $displayName, 'year_group' => $yearGroup]);
                 } elseif ($studentArborId) {
                     \App\Models\Student::where('arbor_id', $studentArborId)
-                        ->where(function ($q) use ($displayName) {
-                            $q->whereNull('name')->orWhere('name', '!=', $displayName);
+                        ->where(function ($q) use ($displayName, $yearGroup) {
+                            $q->whereNull('name')->orWhere('name', '!=', $displayName)->orWhere('year_group', '!=', $yearGroup)->orWhereNull('year_group');
                         })
-                        ->update(['name' => $displayName]);
+                        ->update(['name' => $displayName, 'year_group' => $yearGroup]);
                 }
             }
 
@@ -154,6 +174,10 @@ class ImportBehaviourTutorHoyCommand extends Command
             $dryRun ? ' (dry-run)' : ''
         ));
 
+        if ($skippedMissingRecordId > 0) {
+            $this->warn("Skipped {$skippedMissingRecordId} row(s) where student_record_id could not be resolved from feed + students table.");
+        }
+
         return self::SUCCESS;
     }
 
@@ -209,5 +233,18 @@ class ImportBehaviourTutorHoyCommand extends Command
             ->all();
 
         return $matches;
+    }
+
+    /**
+     * Normalize ID-like values to trimmed strings; returns null when empty.
+     */
+    private function normalizeId(mixed $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        $value = trim((string) $value);
+        return $value !== '' ? $value : null;
     }
 }

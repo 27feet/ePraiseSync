@@ -10,7 +10,8 @@ use App\Models\Teacher;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
+use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseDemeritCategory;
@@ -22,10 +23,28 @@ class UpdateDemerit implements ShouldQueue
     use Queueable;
 
     protected Demerit $demerit;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $demeritID)
     {
         $this->demerit = Demerit::where('id', $demeritID)->firstOrFail();
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id' => $this->demerit->student_id,
+            'teacher_id' => $this->demerit->teacher_id,
+            'class_id'   => $this->demerit->class_id,
+            'subject'    => $this->demerit->subject,
+            'category'   => $this->demerit->category,
+            'reason'     => $this->demerit->reason,
+            'date'       => $this->demerit->date,
+            'points'     => $this->demerit->points,
+            'comment'    => $this->demerit->comment,
+        ];
+        return Checksum::fromFields($fields);
     }
 
     public function handle(): int
@@ -42,10 +61,7 @@ class UpdateDemerit implements ShouldQueue
             'sync_status' => Demerit::STATUS_FAILED_UPDATE,
         ])->save();
 
-        $client = Http::baseUrl(config('services.arbor.base_url'))
-            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-            ->acceptJson()
-            ->asJson();
+        $client = ArborHttp::client();
 
         $matchedTeacher = true;
         $matchedClass   = true;
@@ -65,6 +81,7 @@ class UpdateDemerit implements ShouldQueue
 
         // Early guard: missing student
         if (!$stuID) {
+            $this->rememberError(null, 'Missing student Arbor ID');
             Log::warning('UpdateDemerit: missing student Arbor ID; aborting', [
                 'demerit_id'         => $this->demerit->id,
                 'student_record_id'  => $this->demerit->student_id,
@@ -74,6 +91,9 @@ class UpdateDemerit implements ShouldQueue
                 'sync_status'     => Demerit::STATUS_FAILED_UPDATE,
                 'matched_teacher' => false,
                 'matched_class'   => false,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
             return $writeCount;
         }
@@ -135,12 +155,13 @@ class UpdateDemerit implements ShouldQueue
             $writeCount++;
         }
 
-        $pointID = null;
+        $pointID = $this->demerit->arbor_point_id;
         if ($pointResponse->successful()) {
             $pointData = $pointResponse->json();
             $pointID = str($pointData['pointAward']['href'])->after('/rest-v2/point-awards/')->toInteger();
             $this->demerit['arbor_point_id'] = $pointID;
         } else {
+            $this->rememberError($pointResponse->status(), $pointResponse->body());
             Log::warning('UpdateDemerit: point-awards upsert failed', [
                 'demerit_id' => $this->demerit->id,
                 'status'     => $pointResponse->status(),
@@ -295,6 +316,7 @@ class UpdateDemerit implements ShouldQueue
                                 ->after('/rest-v2/behavioural-incident-actions/')
                                 ->toInteger();
                         } else {
+                            $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                             Log::warning('UpdateDemerit: behavioural-incident-action (PointAward) upsert failed', [
                                 'demerit_id' => $this->demerit->id,
                                 'status'     => $behaviourAction2Response->status(),
@@ -340,6 +362,7 @@ class UpdateDemerit implements ShouldQueue
                                 ->after('/rest-v2/behavioural-incident-actions/')
                                 ->toInteger();
                         } else {
+                            $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                             Log::warning('UpdateDemerit: behavioural-incident-action (Staff) upsert failed', [
                                 'demerit_id' => $this->demerit->id,
                                 'status'     => $behaviourAction1Response->status(),
@@ -356,6 +379,7 @@ class UpdateDemerit implements ShouldQueue
                 } else {
                     // involvement failed -> roll back newly created incident
                     $this->demerit['arbor_behaviour_id'] = null;
+                    $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                     Log::warning('UpdateDemerit: behavioural-incident-student-involvement upsert failed', [
                         'demerit_id' => $this->demerit->id,
@@ -366,6 +390,7 @@ class UpdateDemerit implements ShouldQueue
                     $cleanup = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
                     $writeCount++;
                     if (!$cleanup->successful() && !in_array($cleanup->status(), [404, 410], true)) {
+                        $this->rememberError($cleanup->status(), $cleanup->body());
                         Log::warning('UpdateDemerit: cleanup delete behavioural-incident failed', [
                             'demerit_id'  => $this->demerit->id,
                             'behaviour_id' => $behaviourID,
@@ -376,6 +401,7 @@ class UpdateDemerit implements ShouldQueue
                     $behaviourID = null;
                 }
             } else {
+                $this->rememberError($behaviourResponse->status(), $behaviourResponse->body());
                 Log::warning('UpdateDemerit: behavioural-incidents upsert failed', [
                     'demerit_id' => $this->demerit->id,
                     'status'     => $behaviourResponse->status(),
@@ -386,20 +412,43 @@ class UpdateDemerit implements ShouldQueue
         }
 
         // ----------------- Finalisation -----------------
-        if ($behaviourID || $pointID) {
+        $pointCreated = !empty($this->demerit->arbor_point_id);
+        $behaviourRequired = !empty($internalReference->arbor_behaviour_category_id);
+        $behaviourCreated = !$behaviourRequired
+            || (!empty($this->demerit->arbor_behaviour_id) && !empty($this->demerit->arbor_behaviour_student_id));
+
+        if ($pointCreated && $behaviourCreated) {
+            $checksum = $this->computeChecksum();
             $this->demerit->forceFill([
                 'synced_at'       => now(),
                 'sync_status'     => Demerit::STATUS_PROCESSED_SUCCESSFULLY,
                 'matched_teacher' => $matchedTeacher,
                 'matched_class'   => $matchedClass,
+                'checksum'        => $checksum,
+                'synced_checksum' => $checksum,
+                'sync_attempts'   => 0,
+                'sync_last_failed_at' => null,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => null,
+                'sync_last_error_body' => null,
             ])->save();
         } else {
+            $this->rememberError($this->lastErrorStatus, $this->lastErrorBody ?? 'Update demerit failed');
             $this->demerit->forceFill([
                 'synced_at'   => now(),
                 'sync_status' => Demerit::STATUS_FAILED_UPDATE,
+                'sync_next_retry_at' => null,
+                'sync_last_error_status' => $this->lastErrorStatus,
+                'sync_last_error_body' => $this->lastErrorBody,
             ])->save();
         }
 
         return $writeCount;
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

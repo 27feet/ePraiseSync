@@ -20,6 +20,7 @@ class EpraiseDemeritCategoryResource extends Resource
     protected static ?string $model = EpraiseDemeritCategory::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-rectangle-stack';
+    protected static ?string $navigationGroup = 'Maintenance';
 
     public static function form(Form $form): Form
     {

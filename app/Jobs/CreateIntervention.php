@@ -8,7 +8,7 @@ use App\Models\Teacher;
 use App\Models\ArborStaff;
 use App\Models\Intervention;
 use App\Models\ArborPointCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseInterventionCategory;
@@ -16,12 +16,15 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use App\Support\Checksum;
 
 class CreateIntervention implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Intervention $intervention;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $interventionID)
     {
@@ -32,8 +35,24 @@ class CreateIntervention implements ShouldQueue
     {
         $writeCount = 0;
 
-        // Idempotency: if already synced, bail out
-        if ($this->intervention->arbor_point_id || $this->intervention->arbor_behaviour_id) {
+        // Idempotency: if already synced or partially created, switch to update flow
+        $hasRemote = $this->intervention->arbor_point_id
+            || $this->intervention->arbor_behaviour_id
+            || $this->intervention->arbor_behaviour_student_id;
+        $actions = $this->intervention->arbor_action_id;
+        if (is_string($actions)) {
+            $actions = json_decode($actions, true);
+        }
+        if (is_array($actions)) {
+            $vals = array_filter(array_values($actions));
+            if (!empty($vals)) {
+                $hasRemote = true;
+            }
+        }
+        if ($hasRemote) {
+            $this->intervention->forceFill([
+                'sync_status' => Intervention::STATUS_REQUIRES_UPDATE,
+            ])->save();
             return 0;
         }
 
@@ -43,10 +62,7 @@ class CreateIntervention implements ShouldQueue
             $this->intervention['sync_status'] = Intervention::STATUS_FAILED_CREATION;
             $this->intervention->save();
 
-            $client = Http::baseUrl(config('services.arbor.base_url'))
-                ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-                ->acceptJson()
-                ->asJson();
+            $client = ArborHttp::client();
 
             $behaviourAction1ID = null;
             $behaviourAction2ID = null;
@@ -72,11 +88,15 @@ class CreateIntervention implements ShouldQueue
 
             // Early guard: missing student
             if (!$stuID) {
+                $this->rememberError(null, 'Missing student Arbor ID');
                 $this->intervention->forceFill([
                     'sync_status'     => Intervention::STATUS_FAILED_CREATION,
                     'synced_at'       => now(),
                     'matched_teacher' => false,
                     'matched_class'   => false,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
                 return $writeCount;
             }
@@ -132,6 +152,7 @@ class CreateIntervention implements ShouldQueue
                         ->toInteger();
                     $this->intervention['arbor_point_id'] = $pointID;
                 } else {
+                    $this->rememberError($pointResponse->status(), $pointResponse->body());
                     Log::warning('Arbor point-awards failed (interventions)', [
                         'intervention_id' => $this->intervention->id,
                         'status'          => $pointResponse->status(),
@@ -255,6 +276,7 @@ class CreateIntervention implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                                 Log::warning('Arbor behavioural-incident-action (PointAward) failed (interventions)', [
                                     'intervention_id' => $this->intervention->id,
                                     'status'          => $behaviourAction2Response->status(),
@@ -295,6 +317,7 @@ class CreateIntervention implements ShouldQueue
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
                             } else {
+                                $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                                 Log::warning('Arbor behavioural-incident-action (Staff) failed (interventions)', [
                                     'intervention_id' => $this->intervention->id,
                                     'status'          => $behaviourAction1Response->status(),
@@ -312,6 +335,7 @@ class CreateIntervention implements ShouldQueue
                     } else {
                         // Failed to link student -> clean up incident
                         $this->intervention['arbor_behaviour_id'] = null;
+                        $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                         Log::warning('Arbor behavioural-incident-student-involvements failed (interventions)', [
                             'intervention_id' => $this->intervention->id,
@@ -322,6 +346,7 @@ class CreateIntervention implements ShouldQueue
 
                         $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
                         if (!$response->successful()) {
+                            $this->rememberError($response->status(), $response->body());
                             Log::warning('Arbor delete behavioural-incident failed (interventions)', [
                                 'intervention_id' => $this->intervention->id,
                                 'status'          => $response->status(),
@@ -331,6 +356,7 @@ class CreateIntervention implements ShouldQueue
                         $behaviourID = null;
                     }
                 } else {
+                    $this->rememberError($behaviourResponse->status(), $behaviourResponse->body());
                     Log::warning('Arbor behavioural-incidents failed (interventions)', [
                         'intervention_id' => $this->intervention->id,
                         'status'          => $behaviourResponse->status(),
@@ -343,23 +369,83 @@ class CreateIntervention implements ShouldQueue
             // ========================
             // Finalisation (always)
             // ========================
-            if ($behaviourID || $pointID) {
+            $pointRequired = !empty($internalReference->arbor_point_category_id);
+            $behaviourRequired = !empty($internalReference->arbor_behaviour_category_id);
+            $pointCreated = !$pointRequired || !empty($this->intervention->arbor_point_id);
+            $behaviourCreated = !$behaviourRequired
+                || (!empty($this->intervention->arbor_behaviour_id) && !empty($this->intervention->arbor_behaviour_student_id));
+
+            if ($pointCreated && $behaviourCreated) {
+                $checksum = $this->computeChecksum();
                 $this->intervention->forceFill([
                     'synced_at'       => now(),
                     'sync_status'     => Intervention::STATUS_PROCESSED_SUCCESSFULLY,
                     'matched_teacher' => (bool) $teacherID,
                     'matched_class'   => false,
+                    'checksum'        => $checksum,
+                    'synced_checksum' => $checksum,
+                    'sync_attempts'   => 0,
+                    'sync_last_failed_at' => null,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => null,
+                    'sync_last_error_body' => null,
+                ])->save();
+            } elseif ($this->hasAnyRemote()) {
+                $this->intervention->forceFill([
+                    'synced_at'          => null,
+                    'sync_status'        => Intervention::STATUS_REQUIRES_UPDATE,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
             } else {
+                $this->rememberError($this->lastErrorStatus, $this->lastErrorBody ?? 'Create intervention failed');
                 $this->intervention->forceFill([
                     'synced_at'       => now(),
                     'sync_status'     => Intervention::STATUS_FAILED_CREATION,
                     'matched_teacher' => (bool) $teacherID,
                     'matched_class'   => false,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
             }
         }
 
         return $writeCount;
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id'        => $this->intervention->student_id,
+            'teacher_id'        => $this->intervention->teacher_id,
+            'demerit_id'        => $this->intervention->demerit_id,
+            'subject'           => $this->intervention->subject,
+            'intervention_type' => $this->intervention->intervention_type,
+            'date_added'        => $this->intervention->date_added,
+            'comment'           => $this->intervention->comment,
+        ];
+        return Checksum::fromFields($fields);
+    }
+
+    private function hasAnyRemote(): bool
+    {
+        if ($this->intervention->arbor_point_id || $this->intervention->arbor_behaviour_id || $this->intervention->arbor_behaviour_student_id) {
+            return true;
+        }
+
+        $actions = $this->intervention->arbor_action_id;
+        if (is_string($actions)) {
+            $actions = json_decode($actions, true);
+        }
+
+        return is_array($actions) && !empty(array_filter(array_values($actions)));
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

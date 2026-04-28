@@ -11,10 +11,14 @@ class CheckDemerit extends Model
 
         'record_id',
         'date',
+        'last_seen_at',
+        'last_seen_run',
     ];
 
     protected $casts = [
         'date' => 'datetime',
         'record_id' => 'integer',
+        'last_seen_at' => 'datetime',
+        'last_seen_run' => 'string',
     ];
 }

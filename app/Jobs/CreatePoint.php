@@ -11,7 +11,8 @@ use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
 use App\Models\EpraisePointCategory;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
+use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -21,6 +22,8 @@ class CreatePoint implements ShouldQueue
     use Queueable;
 
     protected Point $point;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $pointID)
     {
@@ -41,10 +44,7 @@ class CreatePoint implements ShouldQueue
             $this->point['sync_status'] = Point::STATUS_FAILED_CREATION;
             $this->point->save();
 
-            $client = Http::baseUrl(config('services.arbor.base_url'))
-                ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-                ->acceptJson()
-                ->asJson();
+            $client = ArborHttp::client();
 
             $matchedTeacher = true;
             $matchedClass   = true;
@@ -66,11 +66,15 @@ class CreatePoint implements ShouldQueue
 
             // Early guard: missing student
             if (!$stuID) {
+                $this->rememberError(null, 'Missing student Arbor ID');
                 $this->point->forceFill([
                     'sync_status'     => Point::STATUS_FAILED_CREATION,
                     'synced_at'       => now(),
                     'matched_teacher' => false,
                     'matched_class'   => false,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
                 return $writeCount;
             }
@@ -133,6 +137,7 @@ class CreatePoint implements ShouldQueue
                 $arborPointId = str($json['pointAward']['href'])
                     ->after('/rest-v2/point-awards/')
                     ->toInteger();
+                $checksum = $this->computeChecksum();
 
                 // Success
                 $this->point->forceFill([
@@ -141,8 +146,16 @@ class CreatePoint implements ShouldQueue
                     'sync_status'     => Point::STATUS_PROCESSED_SUCCESSFULLY,
                     'matched_teacher' => $matchedTeacher,
                     'matched_class'   => $matchedClass,
+                    'checksum'        => $checksum,
+                    'synced_checksum' => $checksum,
+                    'sync_attempts'   => 0,
+                    'sync_last_failed_at' => null,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => null,
+                    'sync_last_error_body' => null,
                 ])->save();
             } else {
+                $this->rememberError($response->status(), $response->body());
                 // Log failure with context
                 Log::warning('CreatePoint: point-awards failed', [
                     'point_id'  => $this->point->id,
@@ -155,10 +168,33 @@ class CreatePoint implements ShouldQueue
                 $this->point->forceFill([
                     'synced_at'   => now(),
                     'sync_status' => Point::STATUS_FAILED_CREATION,
+                    'sync_next_retry_at' => null,
+                    'sync_last_error_status' => $this->lastErrorStatus,
+                    'sync_last_error_body' => $this->lastErrorBody,
                 ])->save();
             }
         }
 
         return $writeCount;
+    }
+
+    private function computeChecksum(): string
+    {
+        $fields = [
+            'student_id' => $this->point->student_id,
+            'teacher_id' => $this->point->teacher_id,
+            'class_id'   => $this->point->class_id,
+            'subject'    => $this->point->subject,
+            'category'   => $this->point->category,
+            'date'       => $this->point->date,
+            'points'     => $this->point->points,
+        ];
+        return Checksum::fromFields($fields);
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

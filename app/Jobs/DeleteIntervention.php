@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Intervention;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -13,6 +13,8 @@ class DeleteIntervention implements ShouldQueue
     use Queueable;
 
     protected Intervention $intervention;
+    protected ?int $lastErrorStatus = null;
+    protected ?string $lastErrorBody = null;
 
     public function __construct(string $interventionID)
     {
@@ -23,10 +25,7 @@ class DeleteIntervention implements ShouldQueue
     {
         $writeCount = 0;
 
-        $client = Http::baseUrl(config('services.arbor.base_url'))
-            ->withBasicAuth(config('services.arbor.username'), config('services.arbor.password'))
-            ->acceptJson()
-            ->asJson();
+        $client = ArborHttp::client();
 
         // ---------- Normalize action IDs into an associative array ----------
         $raw = $this->intervention->arbor_action_id;
@@ -77,6 +76,7 @@ class DeleteIntervention implements ShouldQueue
                 // clear only this one
                 $remainingActions[$label] = null;
             } else {
+                $this->rememberError($res->status(), $res->body());
                 $actionsDeleted = false;
                 Log::warning('DeleteIntervention: delete behavioural-incident-action failed', [
                     'intervention_id' => $this->intervention->id,
@@ -108,6 +108,7 @@ class DeleteIntervention implements ShouldQueue
             if ($ok($res)) {
                 $involvementDeleted = true;
             } else {
+                $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete behavioural-incident-student-involvement failed', [
                     'intervention_id' => $this->intervention->id,
                     'involvement_id'  => $this->intervention->arbor_behaviour_student_id,
@@ -125,6 +126,7 @@ class DeleteIntervention implements ShouldQueue
             if ($ok($res)) {
                 $incidentDeleted = true;
             } else {
+                $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete behavioural-incident failed', [
                     'intervention_id' => $this->intervention->id,
                     'behaviour_id'    => $this->intervention->arbor_behaviour_id,
@@ -142,6 +144,7 @@ class DeleteIntervention implements ShouldQueue
             if ($ok($res)) {
                 $pointDeleted = true;
             } else {
+                $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete point-award failed', [
                     'intervention_id' => $this->intervention->id,
                     'point_id'        => $this->intervention->arbor_point_id,
@@ -163,7 +166,7 @@ class DeleteIntervention implements ShouldQueue
 
         $syncStatus =  ($actionsDeleted && $involvementDeleted && $incidentDeleted && $pointDeleted)
             ? Intervention::STATUS_DELETED
-            : Intervention::STATUS_PARTIALLY_DELETED;
+            : Intervention::STATUS_FAILED_DELETION;
 
         if ($syncStatus === Intervention::STATUS_DELETED) {
             // If everything deleted, we can remove the record entirely
@@ -176,8 +179,17 @@ class DeleteIntervention implements ShouldQueue
                 'arbor_point_id'             => $pointDeleted       ? null : $this->intervention->arbor_point_id,
                 'sync_status'                => $syncStatus,
                 'synced_at'                  => now(),
+                'sync_next_retry_at'         => null,
+                'sync_last_error_status'     => $this->lastErrorStatus,
+                'sync_last_error_body'       => $this->lastErrorBody,
             ])->save();
         }
         return $writeCount;
+    }
+
+    private function rememberError(?int $status, string $body): void
+    {
+        $this->lastErrorStatus = $status;
+        $this->lastErrorBody = substr($body, 0, 4000);
     }
 }

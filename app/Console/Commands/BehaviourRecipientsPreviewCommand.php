@@ -25,13 +25,21 @@ class BehaviourRecipientsPreviewCommand extends Command
 
         /** @var BehaviourRecipientResolver $resolver */
         $resolver = app(BehaviourRecipientResolver::class);
+        $legacyEnabled = (bool) config('behaviour_notifications.enable_legacy_rules', false);
 
         // Pull today’s freshly created logs (adjust the window if you prefer)
-        $logs = BehaviourNotificationLog::query()
-            ->with('rule') // we’ll need staff_roles / template_key etc.
+        $logsQuery = BehaviourNotificationLog::query()
+            ->with(['rule', 'ruleGroup', 'ruleLevel'])
             ->whereBetween('created_at', [$start, $end])
-            ->orderBy('id')
-            ->get();
+            ->orderBy('id');
+
+        if (!$legacyEnabled) {
+            $logsQuery
+                ->whereNotNull('behaviour_rule_group_id')
+                ->whereNotNull('behaviour_rule_level_id');
+        }
+
+        $logs = $logsQuery->get();
 
         if ($logs->isEmpty()) {
             $this->info("No behaviour_notification_logs created between {$start} and {$end}.");
@@ -41,15 +49,37 @@ class BehaviourRecipientsPreviewCommand extends Command
         // Summarise in a table first
         $rows = [];
         foreach ($logs as $log) {
+            $isGroupLog = (bool) $log->behaviour_rule_level_id;
+            if (!$legacyEnabled && !$isGroupLog) {
+                continue;
+            }
             $snap = is_array($log->source_snapshot) ? $log->source_snapshot : [];
-            $src  = $snap['source']   ?? ($log->rule->source   ?? null);
-            $cat  = $snap['category'] ?? ($log->rule->category ?? null);
-            $cnt  = $snap['count']    ?? null;
-            $thr  = $log->hit_threshold ?? ($log->rule->threshold ?? null);
+            $src  = $snap['source']   ?? ($isGroupLog ? ($log->ruleGroup?->source ?? null) : ($log->rule->source ?? null));
+            $rawCategory = $snap['category'] ?? ($isGroupLog ? null : ($log->rule->category ?? null));
+            if ($rawCategory === null && is_string($log->category)) {
+                $decoded = json_decode($log->category, true);
+                $rawCategory = json_last_error() === JSON_ERROR_NONE ? $decoded : $log->category;
+            }
+            $cat  = is_array($rawCategory) ? implode(', ', $rawCategory) : $rawCategory;
+            $cnt  = $snap['value']    ?? ($snap['count'] ?? null);
+            $thr  = $log->hit_threshold ?? ($isGroupLog ? ($log->ruleLevel?->threshold ?? null) : ($log->rule->threshold ?? null));
+            $templateKey = $isGroupLog ? ($log->ruleLevel?->template_key ?? '-') : ($log->rule->template_key ?? '-');
 
-            $studentName = Student::where('arbor_id', $log->student_id)->value('name');
+            $student = Student::where('record_id', (string) $log->student_id)->first();
+            if (!$student) {
+                $student = Student::where('arbor_id', (string) $log->student_id)->first();
+            }
+            $studentName = $student?->name;
 
-            $recips = $resolver->resolveForRule((int)$log->student_id, $log->rule);
+            if ($isGroupLog) {
+                if (!$log->ruleGroup || !$log->ruleLevel) {
+                    $recips = ['staff' => [], 'parents' => []];
+                } else {
+                    $recips = $resolver->resolveForGroupLevel((int) $log->student_id, $log->ruleGroup, $log->ruleLevel);
+                }
+            } else {
+                $recips = $resolver->resolveForRule((int) $log->student_id, $log->rule);
+            }
             $rows[] = [
                 'Log ID'        => $log->id,
                 'Student'       => $studentName ? "{$studentName} ({$log->student_id})" : (string) $log->student_id,
@@ -57,7 +87,7 @@ class BehaviourRecipientsPreviewCommand extends Command
                 'Category'      => $cat ?? '-',
                 'Count'         => $cnt ?? '-',
                 'Threshold'     => $thr ?? '-',
-                'Template'      => $log->rule->template_key ?? '-',
+                'Template'      => $templateKey,
                 'Staff (#)'     => count($recips['staff']),
                 'Parents (#)'   => count($recips['parents']),
                 'Window'        => sprintf(
@@ -80,17 +110,41 @@ class BehaviourRecipientsPreviewCommand extends Command
             $this->line('');
             $this->info('Detailed recipients per log:');
             foreach ($logs as $log) {
-                $studentName = Student::where('arbor_id', $log->student_id)->value('name');
+                $isGroupLog = (bool) $log->behaviour_rule_level_id;
+                if (!$legacyEnabled && !$isGroupLog) {
+                    continue;
+                }
+                $student = Student::where('record_id', (string) $log->student_id)->first();
+                if (!$student) {
+                    $student = Student::where('arbor_id', (string) $log->student_id)->first();
+                }
+                $studentName = $student?->name;
                 $snap = is_array($log->source_snapshot) ? $log->source_snapshot : [];
 
                 $this->line(str_repeat('-', 80));
                 $this->line("Log #{$log->id}  |  Student: " . ($studentName ? "{$studentName} ({$log->student_id})" : $log->student_id));
-                $this->line("Rule: {$log->rule->source} / {$log->rule->category}  (threshold: {$log->rule->threshold}, template: {$log->rule->template_key})");
+                if ($isGroupLog) {
+                    $source = $log->ruleGroup?->source ?? '-';
+                    $category = is_array($snap['category'] ?? null) ? implode(', ', $snap['category']) : ($snap['category'] ?? '-');
+                    $threshold = $log->ruleLevel?->threshold ?? '-';
+                    $template = $log->ruleLevel?->template_key ?? '-';
+                    $this->line("Group: {$source} / {$category}  (threshold: {$threshold}, template: {$template})");
+                } else {
+                    $this->line("Rule: {$log->rule->source} / {$log->rule->category}  (threshold: {$log->rule->threshold}, template: {$log->rule->template_key})");
+                }
                 if (!empty($snap)) {
                     $this->line('Snapshot: ' . json_encode($snap));
                 }
 
-                $recips = $resolver->resolveForRule((int)$log->student_id, $log->rule);
+                if ($isGroupLog) {
+                    if (!$log->ruleGroup || !$log->ruleLevel) {
+                        $recips = ['staff' => [], 'parents' => []];
+                    } else {
+                        $recips = $resolver->resolveForGroupLevel((int) $log->student_id, $log->ruleGroup, $log->ruleLevel);
+                    }
+                } else {
+                    $recips = $resolver->resolveForRule((int)$log->student_id, $log->rule);
+                }
 
                 $this->line('Staff recipients:');
                 if (empty($recips['staff'])) {

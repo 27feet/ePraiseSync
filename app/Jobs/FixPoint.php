@@ -4,7 +4,7 @@ namespace App\Jobs;
 
 use App\Models\Point;
 use App\Models\Demerit;
-use Illuminate\Support\Facades\Http;
+use App\Support\ArborHttp;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 
@@ -28,21 +28,14 @@ class FixPoint implements ShouldQueue
     public function handle(): void
     {
 
-        $baseUrl = rtrim(env('ARBOR_URL'), '/');
         if (!$this->point) {
             return;
         } else {
-            $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
-            $authstring = base64_encode($authtmp);
+            $client = ArborHttp::client();
 
             if (!$this->point->arbor_id) {
             } else {
-                logger(Http::withHeaders([
-                    'Authorization' => 'Basic ' . $authstring,
-                    'Content-Type' => 'application/json',
-                ])->asJson()->delete(
-                    $baseUrl . '/rest-v2/point-award/' . $this->point->arbor_id,
-                ));
+                logger($client->delete('/rest-v2/point-award/' . $this->point->arbor_id));
             };
 
             $this->point['sync_status'] = 0;
