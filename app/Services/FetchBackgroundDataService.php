@@ -450,14 +450,57 @@ GQL;
         }
 
         foreach ($students as $s) {
-            if (!isset($s['id'])) continue;
+            if (! isset($s['id'])) continue;
+
+            $recordId = (int) $s['id'];
+            // You’re mapping UPN to arbor_id; keep if intentional
+            $arborId = $s['upn'] ?? null;
+
+            if ($arborId !== null && $arborId !== '') {
+                $student = Student::where('arbor_id', $arborId)->first();
+
+                if ($student) {
+                    $recordIdOwner = Student::where('record_id', $recordId)
+                        ->whereKeyNot($student->getKey())
+                        ->first();
+
+                    if ($recordIdOwner) {
+                        Log::error('fetchEpraiseStudents: incoming record_id is already assigned to a different student', [
+                            'incoming_record_id' => $recordId,
+                            'incoming_arbor_id' => $arborId,
+                            'existing_student_id' => $student->getKey(),
+                            'existing_student_record_id' => $student->record_id,
+                            'existing_student_arbor_id' => $student->arbor_id,
+                            'record_id_owner_student_id' => $recordIdOwner->getKey(),
+                            'record_id_owner_record_id' => $recordIdOwner->record_id,
+                            'record_id_owner_arbor_id' => $recordIdOwner->arbor_id,
+                        ]);
+
+                        continue;
+                    }
+
+                    $student->update(['record_id' => $recordId]);
+
+                    continue;
+                }
+
+                $recordIdOwner = Student::where('record_id', $recordId)->first();
+                if ($recordIdOwner) {
+                    Log::error('fetchEpraiseStudents: incoming arbor_id is new but record_id is already assigned to a different student', [
+                        'incoming_record_id' => $recordId,
+                        'incoming_arbor_id' => $arborId,
+                        'record_id_owner_student_id' => $recordIdOwner->getKey(),
+                        'record_id_owner_record_id' => $recordIdOwner->record_id,
+                        'record_id_owner_arbor_id' => $recordIdOwner->arbor_id,
+                    ]);
+
+                    continue;
+                }
+            }
 
             Student::updateOrCreate(
-                ['record_id' => $s['id']],
-                [
-                    // You’re mapping UPN to arbor_id; keep if intentional
-                    'arbor_id' => $s['upn'] ?? null,
-                ]
+                ['record_id' => $recordId],
+                ['arbor_id' => $arborId]
             );
         }
     }

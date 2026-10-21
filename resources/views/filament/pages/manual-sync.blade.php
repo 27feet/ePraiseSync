@@ -1,4 +1,10 @@
 <x-filament-panels::page>
+    <div>
+        <x-filament::button tag="a" :href="\App\Filament\Pages\ImportEpraiseFile::getUrl()" color="gray" icon="heroicon-o-arrow-up-tray">
+            Import a saved ePraise file
+        </x-filament::button>
+    </div>
+
     {{ $this->form }}
 
     <div class="flex flex-wrap gap-3 mt-4">
