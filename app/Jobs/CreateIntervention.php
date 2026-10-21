@@ -8,7 +8,7 @@ use App\Models\Teacher;
 use App\Models\ArborStaff;
 use App\Models\Intervention;
 use App\Models\ArborPointCategory;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
 use App\Models\EpraiseInterventionCategory;
@@ -20,6 +20,7 @@ use App\Support\Checksum;
 
 class CreateIntervention implements ShouldQueue
 {
+    use HandlesArborWriteback;
     use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Intervention $intervention;
@@ -31,7 +32,7 @@ class CreateIntervention implements ShouldQueue
         $this->intervention = Intervention::where('id', $interventionID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -62,7 +63,7 @@ class CreateIntervention implements ShouldQueue
             $this->intervention['sync_status'] = Intervention::STATUS_FAILED_CREATION;
             $this->intervention->save();
 
-            $client = ArborHttp::client();
+            $client = $this->arborClient();
 
             $behaviourAction1ID = null;
             $behaviourAction2ID = null;
@@ -275,6 +276,9 @@ class CreateIntervention implements ShouldQueue
                                 $behaviourAction2ID = str($behaviourAction2Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->intervention->arbor_action_id;
+                                $actions['behaviourAction2'] = $behaviourAction2ID;
+                                $this->intervention->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                                 Log::warning('Arbor behavioural-incident-action (PointAward) failed (interventions)', [
@@ -316,6 +320,9 @@ class CreateIntervention implements ShouldQueue
                                 $behaviourAction1ID = str($behaviourAction1Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->intervention->arbor_action_id;
+                                $actions['behaviourAction1'] = $behaviourAction1ID;
+                                $this->intervention->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                                 Log::warning('Arbor behavioural-incident-action (Staff) failed (interventions)', [
@@ -334,7 +341,6 @@ class CreateIntervention implements ShouldQueue
                         ];
                     } else {
                         // Failed to link student -> clean up incident
-                        $this->intervention['arbor_behaviour_id'] = null;
                         $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                         Log::warning('Arbor behavioural-incident-student-involvements failed (interventions)', [
@@ -345,6 +351,9 @@ class CreateIntervention implements ShouldQueue
                         ]);
 
                         $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                        if ($response->successful() || in_array($response->status(), [404, 410], true)) {
+                            $this->intervention['arbor_behaviour_id'] = null;
+                        }
                         if (!$response->successful()) {
                             $this->rememberError($response->status(), $response->body());
                             Log::warning('Arbor delete behavioural-incident failed (interventions)', [

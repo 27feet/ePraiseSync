@@ -12,7 +12,7 @@ use App\Models\Intervention;
 use App\Models\ArborPointCategory;
 use App\Models\EpraiseInterventionCategory;
 use App\Models\ArborBehaviourCategory;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
@@ -21,6 +21,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class UpdateIntervention implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Intervention $intervention;
     protected ?int $lastErrorStatus = null;
@@ -45,7 +46,7 @@ class UpdateIntervention implements ShouldQueue
         return Checksum::fromFields($fields);
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -58,7 +59,7 @@ class UpdateIntervention implements ShouldQueue
             'sync_status' => Intervention::STATUS_FAILED_UPDATE,
         ])->save();
 
-        $client = ArborHttp::client();
+        $client = $this->arborClient();
 
         $matchedTeacher = true;
         $matchedClass   = true;
@@ -339,6 +340,9 @@ class UpdateIntervention implements ShouldQueue
                                 $action2Id = str($act2Json['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->intervention->arbor_action_id;
+                                $actions['behaviourAction2'] = $action2Id;
+                                $this->intervention->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($act2Res->status(), $act2Res->body());
                                 Log::warning('UpdateIntervention: behavioural-incident-action (PointAward) upsert failed', [
@@ -380,6 +384,9 @@ class UpdateIntervention implements ShouldQueue
                                 $action1Id = str($act1Json['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->intervention->arbor_action_id;
+                                $actions['behaviourAction1'] = $action1Id;
+                                $this->intervention->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($act1Res->status(), $act1Res->body());
                                 Log::warning('UpdateIntervention: behavioural-incident-action (Staff) upsert failed', [
@@ -395,7 +402,6 @@ class UpdateIntervention implements ShouldQueue
                             'behaviourAction2' => $action2Id,
                         ];
                     } else {
-                        $this->intervention['arbor_behaviour_id'] = null;
                         $this->rememberError($involRes->status(), $involRes->body());
 
                         Log::warning('UpdateIntervention: behavioural-incident-student-involvement upsert failed', [
@@ -405,6 +411,9 @@ class UpdateIntervention implements ShouldQueue
                         ]);
 
                         $cleanup = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                        if ($cleanup->successful() || in_array($cleanup->status(), [404, 410], true)) {
+                            $this->intervention['arbor_behaviour_id'] = null;
+                        }
                         $writeCount++;
                         if (!$cleanup->successful() && !in_array($cleanup->status(), [404, 410], true)) {
                             $this->rememberError($cleanup->status(), $cleanup->body());

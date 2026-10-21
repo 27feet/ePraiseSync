@@ -18,7 +18,7 @@ class KillPoints extends Controller
         $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
         $authstring = base64_encode($authtmp);
         for ($x = 120207; $x <= 120515; $x++) {
-            logger(Http::withHeaders([
+            logger(Http::withMiddleware(\App\Support\ArborHttp::middleware())->withHeaders([
                 'Authorization' => 'Basic ' . $authstring,
                 'Content-Type' => 'application/json',
             ])->asJson()->delete(

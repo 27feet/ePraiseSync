@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Intervention;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -11,6 +11,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class DeleteIntervention implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Intervention $intervention;
     protected ?int $lastErrorStatus = null;
@@ -21,11 +22,11 @@ class DeleteIntervention implements ShouldQueue
         $this->intervention = Intervention::where('id', $interventionID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
-        $client = ArborHttp::client();
+        $client = $this->arborClient();
 
         // ---------- Normalize action IDs into an associative array ----------
         $raw = $this->intervention->arbor_action_id;
@@ -75,6 +76,7 @@ class DeleteIntervention implements ShouldQueue
             if ($ok($res)) {
                 // clear only this one
                 $remainingActions[$label] = null;
+                $this->intervention->arbor_action_id = $remainingActions;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 $actionsDeleted = false;
@@ -107,6 +109,7 @@ class DeleteIntervention implements ShouldQueue
 
             if ($ok($res)) {
                 $involvementDeleted = true;
+                $this->intervention->arbor_behaviour_student_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete behavioural-incident-student-involvement failed', [
@@ -125,6 +128,7 @@ class DeleteIntervention implements ShouldQueue
 
             if ($ok($res)) {
                 $incidentDeleted = true;
+                $this->intervention->arbor_behaviour_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete behavioural-incident failed', [
@@ -143,6 +147,7 @@ class DeleteIntervention implements ShouldQueue
 
             if ($ok($res)) {
                 $pointDeleted = true;
+                $this->intervention->arbor_point_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteIntervention: delete point-award failed', [

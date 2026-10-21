@@ -11,7 +11,8 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        // Override the package transport so GraphQL reads/mutations share the REST budget.
+        $this->app->singleton(\Softonic\GraphQL\Client::class, fn () => \App\Support\ArborHttp::graphQlClient());
     }
 
     /**

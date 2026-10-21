@@ -10,7 +10,7 @@ use App\Models\Teacher;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
@@ -21,6 +21,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class UpdateDemerit implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Demerit $demerit;
     protected ?int $lastErrorStatus = null;
@@ -47,7 +48,7 @@ class UpdateDemerit implements ShouldQueue
         return Checksum::fromFields($fields);
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -61,7 +62,7 @@ class UpdateDemerit implements ShouldQueue
             'sync_status' => Demerit::STATUS_FAILED_UPDATE,
         ])->save();
 
-        $client = ArborHttp::client();
+        $client = $this->arborClient();
 
         $matchedTeacher = true;
         $matchedClass   = true;
@@ -315,6 +316,9 @@ class UpdateDemerit implements ShouldQueue
                             $action2Id = str($action2Data['behaviouralIncidentAction']['href'])
                                 ->after('/rest-v2/behavioural-incident-actions/')
                                 ->toInteger();
+                            $actions = (array) $this->demerit->arbor_action_id;
+                            $actions['behaviourAction2'] = $action2Id;
+                            $this->demerit->arbor_action_id = $actions;
                         } else {
                             $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                             Log::warning('UpdateDemerit: behavioural-incident-action (PointAward) upsert failed', [
@@ -361,6 +365,9 @@ class UpdateDemerit implements ShouldQueue
                             $action1Id = str($action1Data['behaviouralIncidentAction']['href'])
                                 ->after('/rest-v2/behavioural-incident-actions/')
                                 ->toInteger();
+                            $actions = (array) $this->demerit->arbor_action_id;
+                            $actions['behaviourAction1'] = $action1Id;
+                            $this->demerit->arbor_action_id = $actions;
                         } else {
                             $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                             Log::warning('UpdateDemerit: behavioural-incident-action (Staff) upsert failed', [
@@ -378,7 +385,6 @@ class UpdateDemerit implements ShouldQueue
                     ];
                 } else {
                     // involvement failed -> roll back newly created incident
-                    $this->demerit['arbor_behaviour_id'] = null;
                     $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                     Log::warning('UpdateDemerit: behavioural-incident-student-involvement upsert failed', [
@@ -388,6 +394,9 @@ class UpdateDemerit implements ShouldQueue
                     ]);
 
                     $cleanup = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                    if ($cleanup->successful() || in_array($cleanup->status(), [404, 410], true)) {
+                        $this->demerit['arbor_behaviour_id'] = null;
+                    }
                     $writeCount++;
                     if (!$cleanup->successful() && !in_array($cleanup->status(), [404, 410], true)) {
                         $this->rememberError($cleanup->status(), $cleanup->body());

@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Demerit;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -11,6 +11,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class DeleteDemerit implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Demerit $demerit;
     protected ?int $lastErrorStatus = null;
@@ -21,11 +22,11 @@ class DeleteDemerit implements ShouldQueue
         $this->demerit = Demerit::where('id', $demeritID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
-        $client = ArborHttp::client();
+        $client = $this->arborClient();
 
         // ---------- Normalize action IDs into an associative array ----------
         $raw = $this->demerit->arbor_action_id;
@@ -71,7 +72,8 @@ class DeleteDemerit implements ShouldQueue
             $writeCount++;
 
             if ($ok($res)) {
-                $remainingActions[$label] = null; // clear just this one
+                $remainingActions[$label] = null;
+                $this->demerit->arbor_action_id = $remainingActions; // clear just this one
             } else {
                 $this->rememberError($res->status(), $res->body());
                 $actionsDeleted = false;
@@ -104,6 +106,7 @@ class DeleteDemerit implements ShouldQueue
 
             if ($ok($res)) {
                 $involvementDeleted = true;
+                $this->demerit->arbor_behaviour_student_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteDemerit: delete behavioural-incident-student-involvement failed', [
@@ -122,6 +125,7 @@ class DeleteDemerit implements ShouldQueue
 
             if ($ok($res)) {
                 $incidentDeleted = true;
+                $this->demerit->arbor_behaviour_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteDemerit: delete behavioural-incident failed', [
@@ -140,6 +144,7 @@ class DeleteDemerit implements ShouldQueue
 
             if ($ok($res)) {
                 $pointDeleted = true;
+                $this->demerit->arbor_point_id = null;
             } else {
                 $this->rememberError($res->status(), $res->body());
                 Log::warning('DeleteDemerit: delete point-award failed', [

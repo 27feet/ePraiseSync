@@ -11,7 +11,7 @@ use App\Models\Teacher;
 use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use App\Models\ArborBehaviourCategory;
@@ -23,6 +23,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 
 class CreateDemerit implements ShouldQueue
 {
+    use HandlesArborWriteback;
     use Dispatchable, InteractsWithQueue, Queueable;
 
     protected Demerit $demerit;
@@ -34,7 +35,7 @@ class CreateDemerit implements ShouldQueue
         $this->demerit = Demerit::where('id', $demeritID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -61,7 +62,7 @@ class CreateDemerit implements ShouldQueue
             $this->demerit['sync_status'] = Demerit::STATUS_FAILED_CREATION;
             $this->demerit->save();
 
-            $client = ArborHttp::client();
+            $client = $this->arborClient();
 
             $behaviourAction1ID = null;
             $behaviourAction2ID = null;
@@ -280,6 +281,9 @@ class CreateDemerit implements ShouldQueue
                                 $behaviourAction2ID = str($behaviourAction2Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->demerit->arbor_action_id;
+                                $actions['behaviourAction2'] = $behaviourAction2ID;
+                                $this->demerit->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($behaviourAction2Response->status(), $behaviourAction2Response->body());
                                 Log::warning('CreateDemerit: incident-action (PointAward) failed', [
@@ -321,6 +325,9 @@ class CreateDemerit implements ShouldQueue
                                 $behaviourAction1ID = str($behaviourAction1Data['behaviouralIncidentAction']['href'])
                                     ->after('/rest-v2/behavioural-incident-actions/')
                                     ->toInteger();
+                                $actions = (array) $this->demerit->arbor_action_id;
+                                $actions['behaviourAction1'] = $behaviourAction1ID;
+                                $this->demerit->arbor_action_id = $actions;
                             } else {
                                 $this->rememberError($behaviourAction1Response->status(), $behaviourAction1Response->body());
                                 Log::warning('CreateDemerit: incident-action (Staff) failed', [
@@ -337,7 +344,6 @@ class CreateDemerit implements ShouldQueue
                             'behaviourAction2' => $behaviourAction2ID,
                         ];
                     } else {
-                        $this->demerit['arbor_behaviour_id'] = null;
                         $this->rememberError($behaviourStuResponse->status(), $behaviourStuResponse->body());
 
                         Log::warning('CreateDemerit: student involvement failed; deleting incident', [
@@ -348,6 +354,9 @@ class CreateDemerit implements ShouldQueue
                         ]);
 
                         $response = $client->delete('/rest-v2/behavioural-incidents/' . $behaviourID);
+                        if ($response->successful() || in_array($response->status(), [404, 410], true)) {
+                            $this->demerit['arbor_behaviour_id'] = null;
+                        }
                         if (!$response->successful()) {
                             $this->rememberError($response->status(), $response->body());
                             Log::warning('CreateDemerit: delete behavioural-incident failed', [

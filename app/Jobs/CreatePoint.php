@@ -11,7 +11,7 @@ use App\Models\ArborClass;
 use App\Models\ArborStaff;
 use App\Models\ArborPointCategory;
 use App\Models\EpraisePointCategory;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use App\Support\Checksum;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
@@ -20,6 +20,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class CreatePoint implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Point $point;
     protected ?int $lastErrorStatus = null;
@@ -30,7 +31,7 @@ class CreatePoint implements ShouldQueue
         $this->point = Point::where('id', $pointID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -44,7 +45,7 @@ class CreatePoint implements ShouldQueue
             $this->point['sync_status'] = Point::STATUS_FAILED_CREATION;
             $this->point->save();
 
-            $client = ArborHttp::client();
+            $client = $this->arborClient();
 
             $matchedTeacher = true;
             $matchedClass   = true;

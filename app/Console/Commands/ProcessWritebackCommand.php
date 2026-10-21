@@ -12,7 +12,8 @@ use App\Jobs\CreateDemerit;
 use App\Jobs\DeleteDemerit;
 use App\Jobs\UpdateDemerit;
 use App\Models\Intervention;
-use Illuminate\Support\Sleep;
+use App\Support\ArborSyncRetry;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Console\Command;
 use App\Jobs\CreateIntervention;
 use App\Jobs\DeleteIntervention;
@@ -25,6 +26,8 @@ use Illuminate\Support\Facades\Log;
 class ProcessWritebackCommand extends Command
 {
 
+    private bool $dispatchFailed = false;
+
     protected $signature = 'writeback:processAll';
     protected $description = 'Update Arbor from Database';
     public function __construct()
@@ -34,6 +37,7 @@ class ProcessWritebackCommand extends Command
 
     public function handle()
     {
+        $this->dispatchFailed = false;
         if (TaskMonitor::disabled('writeback:processAll')) {
             $this->info('writeback:processAll is disabled via TaskMonitor.');
             return 0;
@@ -48,7 +52,7 @@ class ProcessWritebackCommand extends Command
         $this->warnOnExhaustedRetries(Demerit::class, 'demerits');
         $this->warnOnExhaustedRetries(Intervention::class, 'interventions');
 
-        // Credit model: 180 credits/min. Points cost 1, demerits/interventions cost 6.
+        // Per-pass dispatch budget (not an API rate limit): 180 credits. Points cost 1, demerits/interventions cost 6.
         $credits = 180;
         $costs = [
             'points'        => 1,
@@ -61,8 +65,7 @@ class ProcessWritebackCommand extends Command
             [Intervention::STATUS_REQUIRES_DELETION, Intervention::STATUS_PARTIALLY_DELETED],
             Intervention::STATUS_READY_TO_DELETE,
             $costs['interventions'],
-            1400,
-            static fn (int $id) => DeleteIntervention::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new DeleteIntervention($id)),
             $credits
         );
 
@@ -71,8 +74,7 @@ class ProcessWritebackCommand extends Command
             [Demerit::STATUS_REQUIRES_DELETION, Demerit::STATUS_PARTIALLY_DELETED],
             Demerit::STATUS_READY_TO_DELETE,
             $costs['demerits'],
-            1400,
-            static fn (int $id) => DeleteDemerit::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new DeleteDemerit($id)),
             $credits
         );
 
@@ -81,8 +83,7 @@ class ProcessWritebackCommand extends Command
             [Point::STATUS_REQUIRES_DELETION, Point::STATUS_PARTIALLY_DELETED],
             Point::STATUS_READY_TO_DELETE,
             $costs['points'],
-            280,
-            static fn (int $id) => DeletePoint::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new DeletePoint($id)),
             $credits
         );
 
@@ -91,8 +92,7 @@ class ProcessWritebackCommand extends Command
             [Intervention::STATUS_REQUIRES_UPDATE],
             Intervention::STATUS_READY_TO_UPDATE,
             $costs['interventions'],
-            1400,
-            static fn (int $id) => UpdateIntervention::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new UpdateIntervention($id)),
             $credits
         );
 
@@ -101,8 +101,7 @@ class ProcessWritebackCommand extends Command
             [Demerit::STATUS_REQUIRES_UPDATE],
             Demerit::STATUS_READY_TO_UPDATE,
             $costs['demerits'],
-            1400,
-            static fn (int $id) => UpdateDemerit::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new UpdateDemerit($id)),
             $credits
         );
 
@@ -111,8 +110,7 @@ class ProcessWritebackCommand extends Command
             [Point::STATUS_REQUIRES_UPDATE],
             Point::STATUS_READY_TO_UPDATE,
             $costs['points'],
-            280,
-            static fn (int $id) => UpdatePoint::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new UpdatePoint($id)),
             $credits
         );
 
@@ -121,8 +119,7 @@ class ProcessWritebackCommand extends Command
             [Intervention::STATUS_REQUIRES_CREATE],
             Intervention::STATUS_READY_TO_CREATE,
             $costs['interventions'],
-            1400,
-            static fn (int $id) => CreateIntervention::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new CreateIntervention($id)),
             $credits
         );
 
@@ -131,8 +128,7 @@ class ProcessWritebackCommand extends Command
             [Demerit::STATUS_REQUIRES_CREATE],
             Demerit::STATUS_READY_TO_CREATE,
             $costs['demerits'],
-            1400,
-            static fn (int $id) => CreateDemerit::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new CreateDemerit($id)),
             $credits
         );
 
@@ -141,13 +137,12 @@ class ProcessWritebackCommand extends Command
             [Point::STATUS_REQUIRES_CREATE],
             Point::STATUS_READY_TO_CREATE,
             $costs['points'],
-            280,
-            static fn (int $id) => CreatePoint::dispatch($id)->afterCommit(),
+            static fn (int $id) => Bus::dispatch(new CreatePoint($id)),
             $credits
         );
 
-        TaskMonitor::heartbeat('writeback:processAll', 'ok');
-        return 0;
+        TaskMonitor::heartbeat('writeback:processAll', $this->dispatchFailed ? 'failed' : 'ok');
+        return $this->dispatchFailed ? self::FAILURE : self::SUCCESS;
     }
 
     /**
@@ -158,7 +153,6 @@ class ProcessWritebackCommand extends Command
         array $eligibleStatuses,
         int $readyStatus,
         int $costPerRecord,
-        int $sleepMs,
         callable $dispatcher,
         int $credits
     ): int {
@@ -197,8 +191,21 @@ class ProcessWritebackCommand extends Command
                 continue;
             }
 
-            Sleep::for($sleepMs)->milliseconds();
-            $dispatcher((int) $record->id);
+            try {
+                $dispatcher((int) $record->id);
+            } catch (\Throwable $e) {
+                // A lost Redis acknowledgement is ambiguous: do not automatically enqueue again.
+                $modelClass::whereKey($record->id)->where('sync_status', $readyStatus)
+                    ->whereNull('sync_last_error_status')->whereNull('sync_last_error_body')->update([
+                    'sync_last_error_body' => 'Queue dispatch failed; delivery uncertain. Use writeback:recover-ready after draining the queue and stopping workers.',
+                ]);
+                Log::error('Writeback queue dispatch failed after READY transition; manual recovery required', [
+                    'model' => $modelClass, 'id' => $record->id, 'ready_status' => $readyStatus,
+                    'exception' => $e::class,
+                ]);
+                $this->dispatchFailed = true;
+                return 0;
+            }
 
             $credits -= $costPerRecord;
         }
@@ -246,7 +253,7 @@ class ProcessWritebackCommand extends Command
                     ->update([
                     'sync_attempts'       => $attempt,
                     'sync_last_failed_at' => now(),
-                    'sync_next_retry_at'  => now()->addSeconds($this->retryDelaySeconds($attempt)),
+                    'sync_next_retry_at'  => now()->addSeconds(ArborSyncRetry::delaySeconds($attempt)),
                 ]);
 
                 if ($updated !== 1) {
@@ -270,32 +277,6 @@ class ProcessWritebackCommand extends Command
                     'sync_next_retry_at' => null,
                 ]);
         }
-    }
-
-    private function retryDelaySeconds(int $attempt): int
-    {
-        $delays = array_values(array_filter(
-            array_map(
-                static fn ($value) => (int) $value,
-                (array) config('services.arbor.sync.retry_delays_seconds', [60, 180, 600, 1800, 3600, 7200, 14400, 21600, 28800, 43200])
-            ),
-            static fn (int $value) => $value > 0
-        ));
-
-        if (empty($delays)) {
-            return 60;
-        }
-
-        $index = min(max($attempt, 1) - 1, count($delays) - 1);
-        $baseDelay = $delays[$index];
-        $jitterPercent = max(0.0, min(0.5, (float) config('services.arbor.sync.retry_jitter_percent', 0.15)));
-        $jitterAmount = (int) round($baseDelay * $jitterPercent);
-
-        if ($jitterAmount <= 0) {
-            return $baseDelay;
-        }
-
-        return max(1, $baseDelay + random_int(-$jitterAmount, $jitterAmount));
     }
 
     /**

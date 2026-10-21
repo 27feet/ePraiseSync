@@ -169,6 +169,20 @@ return [
             'database' => env('REDIS_CACHE_DB', '1'),
         ],
 
+        // Same database/prefix as normal Redis, but limiter I/O must not hold a worker indefinitely.
+        'arbor_limiter' => [
+            'url' => env('REDIS_URL'),
+            'host' => env('REDIS_HOST', '127.0.0.1'),
+            'username' => env('REDIS_USERNAME'),
+            'password' => env('REDIS_PASSWORD'),
+            'port' => env('REDIS_PORT', '6379'),
+            'database' => env('REDIS_DB', '0'),
+            'timeout' => (float) env('ARBOR_REDIS_TIMEOUT_SECONDS', 2),
+            'read_timeout' => (float) env('ARBOR_REDIS_READ_TIMEOUT_SECONDS', 2),
+            'read_write_timeout' => (float) env('ARBOR_REDIS_READ_TIMEOUT_SECONDS', 2),
+            'max_retries' => 0,
+        ],
+
     ],
 
 ];

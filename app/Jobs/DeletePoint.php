@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Point;
-use App\Support\ArborHttp;
+use App\Jobs\Concerns\HandlesArborWriteback;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -11,6 +11,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 class DeletePoint implements ShouldQueue
 {
     use Queueable;
+    use HandlesArborWriteback;
 
     protected Point $point;
     protected ?int $lastErrorStatus = null;
@@ -21,7 +22,7 @@ class DeletePoint implements ShouldQueue
         $this->point = Point::where('id', $pointID)->firstOrFail();
     }
 
-    public function handle(): int
+    protected function performWriteback(): int
     {
         $writeCount = 0;
 
@@ -35,7 +36,7 @@ class DeletePoint implements ShouldQueue
             'sync_status' => Point::STATUS_FAILED_DELETION,
         ])->save();
 
-        $client = ArborHttp::client();
+        $client = $this->arborClient();
 
         // If no remote ID, consider already deleted: mark locally and exit
         if (!$this->point->arbor_id) {

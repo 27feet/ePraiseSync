@@ -17,7 +17,9 @@ class KillConsentTest extends Controller
     public function __invoke(Request $request)
     {
 
-        $authtmp = "parentalconsentmbowelland:aud*fnt.HMP*vzp1akv";
+        $legacy = config('services.arbor.legacy_consent');
+        abort_unless(!empty($legacy['url']) && !empty($legacy['username']) && !empty($legacy['password']), 503, 'Legacy consent tool is disabled until its separate credentials are configured.');
+        $authtmp = $legacy['username'] . ':' . $legacy['password'];
         $authstring = base64_encode($authtmp);
         $removeRecord = false;
         $pageNum = 0;
@@ -48,11 +50,11 @@ GQL;
 
                 if ($removeRecord) {
 
-                    $response = Http::withHeaders([
+                    $response = Http::withMiddleware(\App\Support\ArborHttp::middleware())->withHeaders([
                         'Authorization' => 'Basic ' . $authstring,
                         'Content-Type' => 'application/json',
                     ])->delete(
-                        'https://welland-primary-school.uk.arbor.sc/rest-v2/Consent/' . $consent['consentId'],
+                        rtrim($legacy['url'], '/') . '/rest-v2/Consent/' . $consent['consentId'],
                     );
 
                     if ($response->successful()) {

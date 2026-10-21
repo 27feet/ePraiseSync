@@ -6,6 +6,7 @@ namespace App\Console\Commands;
 use App\Services\FetchBackgroundDataService;
 use Illuminate\Console\Command;
 use App\Support\TaskMonitor;
+use App\Support\ArborThrottledException;
 
 class FetchSystemDataCommand extends Command
 {
@@ -40,19 +41,25 @@ class FetchSystemDataCommand extends Command
         $fetchService11 = new FetchBackgroundDataService();
         $fetchService12 = new FetchBackgroundDataService();
         $fetchService13 = new FetchBackgroundDataService();
-        $fetchService01->fetchAcademicCalendarDates(request());
-        $fetchService02->fetchAcademicYears(request());
-        $fetchService03->fetchArborBehaviourCategories(request());
-        $fetchService04->fetchArborClasses(request(), now()->subDays(10)->toDateString(), now()->addDays(10)->toDateString());
-        $fetchService05->fetchArborPointScales(request());
-        $fetchService06->fetchArborStaff(request());
-        //$fetchService07->fetchArborStudents(request());
-        $fetchService08->fetchEpraiseClasses(request());
-        $fetchService09->fetchEpraiseStudents(request());
-        $fetchService10->fetchEpraiseTeachers(request());
-        $fetchService11->updateDemeritCategories(request());
-        $fetchService12->updateInterventionCategories(request());
-        $fetchService13->updatePointCategories(request());
+        try {
+            $fetchService01->fetchAcademicCalendarDates(request());
+            $fetchService02->fetchAcademicYears(request());
+            $fetchService03->fetchArborBehaviourCategories(request());
+            $fetchService04->fetchArborClasses(request(), now()->subDays(10)->toDateString(), now()->addDays(10)->toDateString());
+            $fetchService05->fetchArborPointScales(request());
+            $fetchService06->fetchArborStaff(request());
+            //$fetchService07->fetchArborStudents(request());
+            $fetchService08->fetchEpraiseClasses(request());
+            $fetchService09->fetchEpraiseStudents(request());
+            $fetchService10->fetchEpraiseTeachers(request());
+            $fetchService11->updateDemeritCategories(request());
+            $fetchService12->updateInterventionCategories(request());
+            $fetchService13->updatePointCategories(request());
+        } catch (ArborThrottledException $e) {
+            TaskMonitor::heartbeat('writeback:fetchSystemData', 'deferred');
+            $this->warn('Arbor system-data fetch deferred; retry after at least '.$e->retryAfterSeconds.' seconds or allow the next scheduled run.');
+            return self::FAILURE;
+        }
 
         TaskMonitor::heartbeat('writeback:fetchSystemData', 'ok');
     }

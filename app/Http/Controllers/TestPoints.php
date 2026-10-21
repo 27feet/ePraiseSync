@@ -16,7 +16,7 @@ class TestPoints extends Controller
     {
         $authtmp = env('ARBOR_APP_USERNAME') . ":" . env('ARBOR_APP_PASSWORD');
         $authstring = base64_encode($authtmp);
-        $response = Http::withHeaders([
+        $response = Http::withMiddleware(\App\Support\ArborHttp::middleware())->withHeaders([
             'Authorization' => 'Basic ' . $authstring, // Example header
             'Content-Type' => 'application/json',
         ])->delete(

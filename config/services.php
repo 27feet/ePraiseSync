@@ -39,6 +39,24 @@ return [
         'base_url' => env('ARBOR_URL'),
         'username' => env('ARBOR_APP_USERNAME'),
         'password' => env('ARBOR_APP_PASSWORD'),
+        // Unused legacy consent tool has a separate account; disabled unless explicitly configured.
+        'legacy_consent' => [
+            'url' => env('ARBOR_LEGACY_CONSENT_URL'),
+            'username' => env('ARBOR_LEGACY_CONSENT_USERNAME'),
+            'password' => env('ARBOR_LEGACY_CONSENT_PASSWORD'),
+        ],
+        'rate_limit' => [
+            'redis_connection' => env('ARBOR_RATE_LIMIT_REDIS_CONNECTION', 'arbor_limiter'),
+            'key' => env('ARBOR_RATE_LIMIT_KEY', 'arbor:writeback'),
+            'requests' => (int) env('ARBOR_RATE_LIMIT_REQUESTS', 240),
+            'window_ms' => (int) env('ARBOR_RATE_LIMIT_WINDOW_MS', 60000),
+            'min_interval_ms' => (int) env('ARBOR_RATE_LIMIT_MIN_INTERVAL_MS', 250),
+            'max_wait_ms' => (int) env('ARBOR_RATE_LIMIT_MAX_WAIT_MS', 1000),
+            'cooldown_seconds' => (int) env('ARBOR_RATE_LIMIT_COOLDOWN_SECONDS', 60),
+            'connect_timeout_seconds' => (int) env('ARBOR_CONNECT_TIMEOUT_SECONDS', 5),
+            'request_timeout_seconds' => (int) env('ARBOR_REQUEST_TIMEOUT_SECONDS', 15),
+            'job_budget_seconds' => (int) env('ARBOR_WRITEBACK_JOB_BUDGET_SECONDS', 45),
+        ],
         'sync' => [
             'max_attempts' => (int) env('ARBOR_SYNC_MAX_ATTEMPTS', 10),
             'retry_delays_seconds' => array_map(
