@@ -55,6 +55,13 @@ HTTP admission costs one token regardless of record type.
 | Actual HTTP 429 | Stop that job immediately; preserve partial IDs, HTTP status/body; increment attempts once; set last-failed timestamp and next retry to the later of Retry-After and configured backoff plus jitter. At the cap, remain failed without automatic retry. |
 | Other HTTP failure | Existing job failure status/body handling remains; the normal dispatcher allocates increasing backoff/attempts for failed records whose next retry is null. If a real HTTP failure occurred before a later local deferral in the same multi-request job, that failure is preserved and scheduled once rather than being hidden by the local deferral. |
 
+Retry scheduling preserves `sync_last_failed_at` and the existing error status/body:
+only an actual remote HTTP failure updates the failure timestamp in the worker.
+For a failed row with no retry time, the scheduler intentionally increments
+`sync_attempts` once to allocate the next retry/backoff. Subsequent passes do not
+increment it while that retry is pending. HTTP 429 handling already allocates its
+attempt and retry time in the worker, so the scheduler does not allocate it again.
+
 A focused test cycles a record through 20 dispatcher/job/local-deferral rounds with
 `ARBOR_SYNC_MAX_ATTEMPTS=2`: its attempt counter stays at 1, its previous real 429 evidence
 is unchanged, and no HTTP request is sent. A separate test covers a previously authorised

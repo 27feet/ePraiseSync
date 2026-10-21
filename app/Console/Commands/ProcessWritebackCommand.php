@@ -252,7 +252,6 @@ class ProcessWritebackCommand extends Command
                     ->where('sync_attempts', (int) $record->sync_attempts)
                     ->update([
                     'sync_attempts'       => $attempt,
-                    'sync_last_failed_at' => now(),
                     'sync_next_retry_at'  => now()->addSeconds(ArborSyncRetry::delaySeconds($attempt)),
                 ]);
 

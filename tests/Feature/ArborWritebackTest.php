@@ -132,6 +132,115 @@ class ArborWritebackTest extends TestCase
         Bus::assertNothingDispatched();
     }
 
+    public function test_scheduling_retries_preserves_historical_failure_evidence(): void
+    {
+        $this->freezeTime();
+        Bus::fake();
+        $historicalFailure = now()->subDay()->toDateTimeString();
+        $records = [];
+        foreach ([\App\Models\Point::class, \App\Models\Demerit::class, \App\Models\Intervention::class] as $class) {
+            foreach ([$class::STATUS_FAILED_CREATION, $class::STATUS_FAILED_UPDATE, $class::STATUS_FAILED_DELETION] as $index => $status) {
+                $attributes = [
+                    'record_id' => 123 + $index, 'sync_status' => $status, 'sync_attempts' => 2,
+                    'sync_last_failed_at' => $historicalFailure, 'sync_next_retry_at' => null,
+                    'sync_last_error_status' => 429, 'sync_last_error_body' => 'Historical 429',
+                ];
+                $records[] = $class === \App\Models\Point::class
+                    ? $this->point($attributes) : $this->complexRecord($class, $attributes);
+            }
+        }
+
+        $this->artisan('writeback:processAll')->assertSuccessful();
+
+        foreach ($records as $record) {
+            $record->refresh();
+            $this->assertSame($historicalFailure, $record->sync_last_failed_at->toDateTimeString());
+            $this->assertSame(429, $record->sync_last_error_status);
+            $this->assertSame('Historical 429', $record->sync_last_error_body);
+            $this->assertSame(3, $record->sync_attempts);
+            $this->assertSame(now()->addSeconds(ArborSyncRetry::delaySeconds(3))->toDateTimeString(), $record->sync_next_retry_at->toDateTimeString());
+        }
+        Bus::assertNothingDispatched();
+        Http::assertNothingSent();
+    }
+
+    public function test_repeated_scheduler_passes_do_not_refresh_failure_timestamps_or_allocate_again(): void
+    {
+        $this->freezeTime();
+        Bus::fake();
+        $record = $this->complexRecord(\App\Models\Intervention::class, [
+            'sync_status' => 11, 'sync_attempts' => 0, 'sync_last_failed_at' => now()->subDay(),
+            'sync_last_error_status' => 429, 'sync_last_error_body' => 'Historical 429',
+        ]);
+        $historicalFailure = $record->sync_last_failed_at->toDateTimeString();
+        $retryAt = now()->addSeconds(ArborSyncRetry::delaySeconds(1))->toDateTimeString();
+        for ($i = 0; $i < 3; $i++) {
+            $this->artisan('writeback:processAll')->assertSuccessful();
+            $record->refresh();
+            $this->assertSame($historicalFailure, $record->sync_last_failed_at->toDateTimeString());
+            $this->assertSame($retryAt, $record->sync_next_retry_at->toDateTimeString());
+            $this->assertSame(1, $record->sync_attempts);
+            $this->assertSame(429, $record->sync_last_error_status);
+            $this->assertSame('Historical 429', $record->sync_last_error_body);
+            $this->travel(10)->seconds();
+        }
+        Bus::assertNothingDispatched();
+        $this->travel(ArborSyncRetry::delaySeconds(1))->seconds();
+        $this->artisan('writeback:processAll')->assertSuccessful();
+        $record->refresh();
+        $this->assertSame(10, $record->sync_status);
+        $this->assertSame($historicalFailure, $record->sync_last_failed_at->toDateTimeString());
+        $this->assertSame(1, $record->sync_attempts);
+        $this->assertSame(429, $record->sync_last_error_status);
+        $this->assertSame('Historical 429', $record->sync_last_error_body);
+        Bus::assertDispatched(\App\Jobs\CreateIntervention::class);
+        Http::assertNothingSent();
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('remoteFailureStatuses')]
+    public function test_subsequent_http_failure_updates_timestamp_before_retry_scheduling(int $status): void
+    {
+        $this->freezeTime();
+        if ($status === 429) {
+            $this->mock(ArborRateLimiter::class, function ($mock) {
+                $mock->shouldReceive('waitMilliseconds')->once()->andReturn(0);
+                $mock->shouldReceive('cooldown')->once()->with(60);
+            });
+        }
+        Http::fake(['arbor.test/*' => Http::response('New remote failure', $status)]);
+        $point = $this->point([
+            'sync_attempts' => 3, 'sync_last_failed_at' => now()->subDay(),
+            'sync_last_error_status' => 429, 'sync_last_error_body' => 'Historical 429',
+        ]);
+        $failedAt = now()->toDateTimeString();
+
+        (new CreatePoint($point->id))->handle();
+
+        $point->refresh();
+        $this->assertSame(11, $point->sync_status);
+        $this->assertSame($failedAt, $point->sync_last_failed_at->toDateTimeString());
+        $this->assertSame($status, $point->sync_last_error_status);
+        $this->assertSame('New remote failure', $point->sync_last_error_body);
+        $this->assertSame($status === 429 ? 4 : 3, $point->sync_attempts);
+        Http::assertSentCount(1);
+
+        $this->travel(1)->seconds();
+        Bus::fake();
+        $this->artisan('writeback:processAll')->assertSuccessful();
+        $point->refresh();
+        $this->assertSame($failedAt, $point->sync_last_failed_at->toDateTimeString());
+        $this->assertSame($status, $point->sync_last_error_status);
+        $this->assertSame('New remote failure', $point->sync_last_error_body);
+        $this->assertSame(4, $point->sync_attempts);
+        $this->assertNotNull($point->sync_next_retry_at);
+        Bus::assertNothingDispatched();
+    }
+
+    public static function remoteFailureStatuses(): array
+    {
+        return ['ordinary HTTP failure' => [500], 'HTTP 429' => [429]];
+    }
+
     public function test_429_preserves_error_and_respects_retry_after_without_repeating_http(): void
     {
         $this->mock(ArborRateLimiter::class, function ($mock) {

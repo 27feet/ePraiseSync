@@ -41,7 +41,13 @@ trait HandlesArborWriteback
             (int) config('services.arbor.rate_limit.job_budget_seconds', 45),
         );
         try {
-            return $this->performWriteback();
+            $writeCount = $this->performWriteback();
+            // Ordinary HTTP failures are timestamped by the worker, never by retry scheduling.
+            if ($record->exists && $this->lastErrorStatus !== null && $record->sync_last_error_status !== null) {
+                $record->forceFill(['sync_last_failed_at' => now()])->save();
+            }
+
+            return $writeCount;
         } catch (ArborThrottledException $e) {
             $this->checkpointArborProgress();
             // A partly created record resumes through Update, which already fills missing resources.
